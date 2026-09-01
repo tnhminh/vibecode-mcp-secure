@@ -1,0 +1,9 @@
+node_modules/
+.env
+.runtime/*
+!.runtime/.gitkeep
+bin/*
+!bin/.gitkeep
+.vibecode-artifacts/
+*.log
+.DS_Store

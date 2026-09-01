@@ -1,0 +1,24 @@
+{
+  "name": "vibecode-mcp-secure",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first Vibecode MCP server for ChatGPT over OpenAI Secure MCP Tunnel",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node --check src/server.mjs && node --check scripts/selftest.mjs",
+    "selftest": "node scripts/selftest.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/express": "2.0.0",
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "express": "5.2.1",
+    "playwright": "1.62.1",
+    "zod": "4.5.4"
+  }
+}
