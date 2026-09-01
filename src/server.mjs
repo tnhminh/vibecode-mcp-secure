@@ -17,6 +17,7 @@ loadEnvFile(path.join(PROJECT_ROOT, '.env'));
 const HOST = process.env.VIBECODE_HOST || '127.0.0.1';
 const PORT = Number(process.env.VIBECODE_PORT || 7317);
 const WORKSPACE = path.resolve(process.env.VIBECODE_WORKSPACE || process.cwd());
+const CANONICAL_WORKSPACE = fs.existsSync(WORKSPACE) ? fs.realpathSync(WORKSPACE) : WORKSPACE;
 const MAX_READ_BYTES = Number(process.env.VIBECODE_MAX_READ_BYTES || 262144);
 const MAX_COMMAND_OUTPUT_BYTES = Number(process.env.VIBECODE_MAX_COMMAND_OUTPUT_BYTES || 262144);
 const SHELL_MODE = process.env.VIBECODE_SHELL_MODE || 'allowlist';
@@ -36,6 +37,7 @@ const ignoredDirs = new Set(['.git', 'node_modules', '.next', 'dist', 'build', '
 const processRegistry = new Map();
 let browserState = null;
 const toolCounters = new Map();
+let lastVerification = null;
 let tunnelRuntime = {
   child: null,
   status: 'disconnected',
@@ -79,13 +81,21 @@ async function audit(tool, args, status, extra = {}) {
 }
 
 function sanitizeArgs(args) {
-  if (!args || typeof args !== 'object') return args;
-  const clone = structuredClone(args);
-  for (const key of Object.keys(clone)) {
-    if (/key|token|secret|password|authorization/i.test(key)) clone[key] = '[REDACTED]';
-    if (typeof clone[key] === 'string' && clone[key].length > 1200) clone[key] = clone[key].slice(0, 1200) + '…';
+  return sanitizeAuditValue(args, '');
+}
+
+function sanitizeAuditValue(value, key) {
+  if (/key|token|secret|password|authorization/i.test(key)) return '[REDACTED]';
+  if (typeof value === 'string') {
+    if (/content|replacement|replace|find|body/i.test(key)) return `[OMITTED ${Buffer.byteLength(value, 'utf8')} bytes]`;
+    const redacted = value.replace(/(?:sk|rk|ghp|github_pat|token)[_-][A-Za-z0-9_-]{12,}/gi, '[REDACTED]');
+    return redacted.length > 600 ? redacted.slice(0, 600) + '…' : redacted;
   }
-  return clone;
+  if (Array.isArray(value)) return value.map(item => sanitizeAuditValue(item, key));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => [childKey, sanitizeAuditValue(childValue, childKey)]));
+  }
+  return value;
 }
 
 function isValidTunnelId(value) {
@@ -214,13 +224,34 @@ function classifyError(message) {
   return 'TOOL_ERROR';
 }
 
+function isInsideRoot(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function canonicalCandidatePath(candidate) {
+  if (fs.existsSync(candidate)) return fs.realpathSync(candidate);
+  let parent = path.dirname(candidate);
+  while (parent !== path.dirname(parent) && !fs.existsSync(parent)) parent = path.dirname(parent);
+  if (!fs.existsSync(parent)) return candidate;
+  const canonicalParent = fs.realpathSync(parent);
+  return path.resolve(canonicalParent, path.relative(parent, candidate));
+}
+
 function resolveWorkspacePath(input = '.') {
   const candidate = path.isAbsolute(input) ? path.resolve(input) : path.resolve(WORKSPACE, input);
-  const relative = path.relative(WORKSPACE, candidate);
-  if (relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative))) return candidate;
-  const err = new Error(`Path is outside workspace: ${input}`);
-  err.code = 'WORKSPACE_VIOLATION';
-  throw err;
+  if (!isInsideRoot(WORKSPACE, candidate)) {
+    const err = new Error(`Path is outside workspace: ${input}`);
+    err.code = 'WORKSPACE_VIOLATION';
+    throw err;
+  }
+  const canonical = canonicalCandidatePath(candidate);
+  if (!isInsideRoot(CANONICAL_WORKSPACE, canonical)) {
+    const err = new Error(`Path escapes workspace through symlink/junction: ${input}`);
+    err.code = 'WORKSPACE_VIOLATION';
+    throw err;
+  }
+  return candidate;
 }
 
 async function assertFileSize(file, max = MAX_READ_BYTES) {
@@ -293,7 +324,7 @@ function validateCommand(command) {
   }
   if (SHELL_MODE === 'workspace-trusted') return;
   if (SHELL_MODE !== 'allowlist') throw new Error(`Unknown VIBECODE_SHELL_MODE=${SHELL_MODE}`);
-  const segments = command.split(/&&|\|\||[;|]/).map(s => s.trim()).filter(Boolean);
+  const segments = command.split(/&&|\|\||[;&|]/).map(s => s.trim()).filter(Boolean);
   for (const segment of segments) {
     const first = segment.match(/^"?([^"\s]+)"?/i)?.[1] || '';
     const exe = path.basename(first).replace(/\.(cmd|exe|bat)$/i, '').toLowerCase();
@@ -344,6 +375,173 @@ async function git(args, cwd = '.', timeoutMs = 120000) {
 
 function quoteArg(s) {
   return `"${String(s).replace(/"/g, '\\"')}"`;
+}
+
+async function runVerification(cwd = '.', timeoutMsPerStep = 180000) {
+  const startedAt = new Date().toISOString();
+  const root = resolveWorkspacePath(cwd);
+  const pkgPath = path.join(root, 'package.json');
+  if (!fs.existsSync(pkgPath)) throw new Error('verify_project currently expects package.json in cwd.');
+  const pkg = JSON.parse(await fsp.readFile(pkgPath, 'utf8'));
+  const scripts = pkg.scripts || {};
+  const names = ['lint', 'typecheck', 'check', 'test', 'build'];
+  const results = [];
+  for (const name of names) {
+    if (!scripts[name]) continue;
+    const result = await runCommand(`npm run ${name}`, cwd, timeoutMsPerStep);
+    results.push({ step: name, ok: result.exitCode === 0, ...result });
+    if (result.exitCode !== 0) break;
+  }
+  lastVerification = {
+    ok: results.length > 0 && results.every(r => r.ok),
+    steps: results,
+    skipped: names.filter(n => !scripts[n]),
+    startedAt,
+    finishedAt: new Date().toISOString()
+  };
+  return lastVerification;
+}
+
+async function readAuditEvents(limit = 60) {
+  if (!fs.existsSync(AUDIT_FILE)) return [];
+  const lines = (await fsp.readFile(AUDIT_FILE, 'utf8')).trim().split(/\r?\n/).filter(Boolean);
+  return lines.slice(-limit).map(line => {
+    try { return JSON.parse(line); } catch { return { raw: line }; }
+  });
+}
+
+function processSnapshot() {
+  const items = [...processRegistry.values()].map(p => ({
+    id: p.id,
+    pid: p.child.pid,
+    command: p.command,
+    cwd: p.cwd,
+    status: p.status,
+    exitCode: p.exitCode,
+    logLines: p.logs.length
+  }));
+  return {
+    items,
+    running: items.filter(p => p.status === 'running').length,
+    exited: items.filter(p => p.status === 'exited').length,
+    failed: items.filter(p => p.status === 'error' || (p.status === 'exited' && p.exitCode && p.exitCode !== 0)).length
+  };
+}
+
+async function gitDashboardSummary() {
+  const status = await git(['status', '--short', '--branch']);
+  if (status.exitCode !== 0) return { available: false, error: (status.stderr || status.stdout || 'Not a Git repository').trim() };
+  const lines = status.stdout.trim().split(/\r?\n/).filter(Boolean);
+  const headLine = lines[0] || '## unknown';
+  const head = headLine.replace(/^##\s*/, '');
+  const branch = head.split('...')[0].split(' ')[0] || 'unknown';
+  const changes = lines.slice(1);
+  const latest = await git(['log', '-1', '--pretty=format:%h|%s|%cI']);
+  const origin = await git(['remote', 'get-url', 'origin']);
+  let commit = null;
+  if (latest.exitCode === 0 && latest.stdout.trim()) {
+    const [hash, subject, committedAt] = latest.stdout.trim().split('|');
+    commit = { hash, subject, committedAt };
+  }
+  return {
+    available: true,
+    branch,
+    tracking: head.includes('...') ? head.split('...')[1].split(' ')[0] : null,
+    clean: changes.length === 0,
+    changedFiles: changes.length,
+    changes: changes.slice(0, 20),
+    origin: origin.exitCode === 0 ? origin.stdout.trim() : null,
+    commit
+  };
+}
+
+function securityDashboardSummary() {
+  const warnings = [];
+  const critical = [];
+  if (HOST !== '127.0.0.1') critical.push('MCP listener không bind vào loopback.');
+  if (ALLOW_DANGEROUS) critical.push('Dangerous command mode đang được bật.');
+  if (SHELL_MODE === 'workspace-trusted') warnings.push('Shell đang ở workspace-trusted; repository scripts có quyền của Windows account.');
+  if (BROWSER_ALLOW_EXTERNAL) warnings.push('Browser được phép điều hướng ra host bên ngoài.');
+  warnings.push('Granular project permission engine chưa được triển khai.');
+  return {
+    level: critical.length ? 'danger' : warnings.length ? 'warning' : 'ok',
+    critical,
+    warnings,
+    protections: [
+      { label: 'MCP listener', value: HOST, ok: HOST === '127.0.0.1' },
+      { label: 'Workspace boundary', value: 'canonical', ok: true },
+      { label: 'Shell policy', value: SHELL_MODE, ok: SHELL_MODE === 'allowlist' },
+      { label: 'Dangerous commands', value: ALLOW_DANGEROUS ? 'allowed' : 'blocked', ok: !ALLOW_DANGEROUS },
+      { label: 'External browser', value: BROWSER_ALLOW_EXTERNAL ? 'allowed' : 'blocked', ok: !BROWSER_ALLOW_EXTERNAL },
+      { label: 'Audit logging', value: 'enabled', ok: true }
+    ]
+  };
+}
+
+async function browserDashboardSummary() {
+  if (!browserState) return { active: false, url: null, title: null, consoleErrors: 0, networkErrors: 0 };
+  return {
+    active: true,
+    url: browserState.page.url(),
+    title: await browserState.page.title().catch(() => ''),
+    consoleErrors: browserState.console.filter(x => x.type === 'error').length,
+    networkErrors: browserState.networkErrors.length
+  };
+}
+
+async function dashboardPayload() {
+  const [gitState, activity, browser] = await Promise.all([
+    gitDashboardSummary(),
+    readAuditEvents(60),
+    browserDashboardSummary()
+  ]);
+  const processes = processSnapshot();
+  const security = securityDashboardSummary();
+  const success = activity.filter(x => x.status === 'success').length;
+  const failures = activity.filter(x => x.status === 'failure').length;
+  const durations = activity.map(x => Number(x.duration_ms)).filter(Number.isFinite);
+  const lastError = [...activity].reverse().find(x => x.status === 'failure') || null;
+  const packageInfo = (() => {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(WORKSPACE, 'package.json'), 'utf8'));
+      return { name: pkg.name || path.basename(WORKSPACE), version: pkg.version || null };
+    } catch {
+      return { name: path.basename(WORKSPACE), version: null };
+    }
+  })();
+  const tunnel = tunnelSummary();
+  const workspaceReady = fs.existsSync(WORKSPACE);
+  const overall = !workspaceReady
+    ? 'down'
+    : security.level === 'danger'
+      ? 'degraded'
+      : tunnel.runtimeStatus === 'connected'
+        ? security.level === 'warning' ? 'attention' : 'healthy'
+        : 'setup';
+  return {
+    service: 'vibecode-mcp-secure',
+    version: '0.1.0',
+    workspace: WORKSPACE,
+    package: packageInfo,
+    runtime: { node: process.version, platform: process.platform, host: HOST, port: PORT },
+    shellMode: SHELL_MODE,
+    toolsCalled: Object.fromEntries(toolCounters),
+    processes,
+    tunnel,
+    git: gitState,
+    verification: lastVerification,
+    browser,
+    security,
+    activity: {
+      items: activity.slice(-20).reverse(),
+      total: activity.length,
+      success,
+      failures,
+      avgDurationMs: durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0,
+      lastError
+    },
+    readiness: { workspaceReady, overall }
+  };
 }
 
 function registerTools(server) {
@@ -536,22 +734,7 @@ function registerTools(server) {
   server.registerTool('verify_project', {
     description: 'Run available lint/typecheck/test/build package scripts in sequence and summarize results.',
     inputSchema: z.object({ cwd: z.string().default('.'), timeoutMsPerStep: z.number().int().min(5000).max(600000).default(180000) })
-  }, wrappedTool('verify_project', async ({ cwd = '.', timeoutMsPerStep = 180000 }) => {
-    const root = resolveWorkspacePath(cwd);
-    const pkgPath = path.join(root, 'package.json');
-    if (!fs.existsSync(pkgPath)) throw new Error('verify_project currently expects package.json in cwd.');
-    const pkg = JSON.parse(await fsp.readFile(pkgPath, 'utf8'));
-    const scripts = pkg.scripts || {};
-    const names = ['lint', 'typecheck', 'check', 'test', 'build'];
-    const results = [];
-    for (const name of names) {
-      if (!scripts[name]) continue;
-      const result = await runCommand(`npm run ${name}`, cwd, timeoutMsPerStep);
-      results.push({ step: name, ok: result.exitCode === 0, ...result });
-      if (result.exitCode !== 0) break;
-    }
-    return { ok: results.length > 0 && results.every(r => r.ok), steps: results, skipped: names.filter(n => !scripts[n]) };
-  }));
+  }, wrappedTool('verify_project', async ({ cwd = '.', timeoutMsPerStep = 180000 }) => runVerification(cwd, timeoutMsPerStep)));
 
   server.registerTool('audit_tail', {
     description: 'Read recent MCP audit events.', inputSchema: z.object({ limit: z.number().int().min(1).max(500).default(100) })
@@ -628,16 +811,35 @@ app.get('/readyz', async (_req, res) => {
   const workspaceExists = fs.existsSync(WORKSPACE);
   res.status(workspaceExists ? 200 : 503).json({ ready: workspaceExists, workspace: WORKSPACE, reason: workspaceExists ? undefined : 'workspace_not_found' });
 });
-function statusPayload() {
-  return {
-    service: 'vibecode-mcp-secure', version: '0.1.0', workspace: WORKSPACE, shellMode: SHELL_MODE,
-    toolsCalled: Object.fromEntries(toolCounters),
-    processes: [...processRegistry.values()].map(p => ({ id: p.id, pid: p.child.pid, command: p.command, status: p.status, exitCode: p.exitCode })),
-    tunnel: tunnelSummary()
-  };
-}
-
-app.get('/api/status', (_req, res) => res.json(statusPayload()));
+app.get('/api/status', async (_req, res) => {
+  try { res.json(await dashboardPayload()); }
+  catch (error) { res.status(500).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
+});
+app.get('/api/git/diff', async (_req, res) => {
+  const result = await git(['diff']);
+  res.status(result.exitCode === 0 ? 200 : 400).json(result);
+});
+app.get('/api/process/:id/logs', (req, res) => {
+  const p = processRegistry.get(req.params.id);
+  if (!p) return res.status(404).json({ ok: false, error: 'Unknown process id.' });
+  res.json({ ok: true, id: p.id, status: p.status, logs: p.logs.slice(-200) });
+});
+app.post('/api/process/:id/stop', async (req, res) => {
+  const p = processRegistry.get(req.params.id);
+  if (!p) return res.status(404).json({ ok: false, error: 'Unknown process id.' });
+  if (p.status !== 'running') return res.json({ ok: true, id: p.id, status: p.status, exitCode: p.exitCode });
+  try {
+    if (process.platform === 'win32') await runSpawn('taskkill', ['/PID', String(p.child.pid), '/T'], WORKSPACE, 15000).catch(() => p.child.kill());
+    else p.child.kill('SIGTERM');
+    res.json({ ok: true, id: p.id, stopped: true });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.post('/api/verify', async (_req, res) => {
+  try { res.json({ ok: true, verification: await runVerification('.', 180000) }); }
+  catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
+});
 app.post('/api/tunnel/connect', (req, res) => {
   try {
     const tunnelId = String(req.body?.tunnelId || '').trim();
@@ -653,77 +855,10 @@ app.post('/api/tunnel/disconnect', (_req, res) => {
   try { res.json({ ok: true, tunnel: disconnectTunnel() }); }
   catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
 });
-app.get('/', (_req, res) => res.type('html').send(renderControlCenter(statusPayload())));
-
-function renderControlCenter(status) {
-  const endpoint = `http://${HOST}:${PORT}/mcp`;
-  const setupReady = status.tunnel.configured && status.tunnel.clientInstalled;
-  const nextAction = !status.tunnel.configured
-    ? 'Nhập Tunnel ID và Runtime API key ở phần Kết nối Tunnel.'
-    : !status.tunnel.clientInstalled
-      ? 'Chạy SETUP.cmd để cài tunnel-client.'
-      : 'Kết nối Tunnel ở đây, rồi thêm connector trong ChatGPT.';
-  const connectionLabel = setupReady ? 'Sẵn sàng đấu nối' : 'Chưa hoàn tất cấu hình';
-  const connectionClass = setupReady ? 'ready' : 'pending';
-  return `<!doctype html>
-<html lang="vi">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Vibecode MCP · Control Center</title>
-  <style>
-    :root{--ink:#16213a;--muted:#667085;--line:#e6eaf0;--surface:#fff;--canvas:#f6f8fc;--blue:#315efb;--blue-dark:#2347c7;--green:#147a53;--green-bg:#e9f9f1;--amber:#a65800;--amber-bg:#fff5e6;--shadow:0 18px 55px rgba(25,45,85,.09)}
-    *{box-sizing:border-box} body{margin:0;background:var(--canvas);color:var(--ink);font:15px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
-    .wrap{max-width:1180px;margin:auto;padding:30px 22px 56px}.top{display:flex;justify-content:space-between;gap:22px;align-items:flex-start;margin-bottom:25px}.brand{display:flex;gap:13px;align-items:center}.mark{display:grid;place-items:center;width:43px;height:43px;border-radius:13px;background:linear-gradient(135deg,#315efb,#6948ed);color:#fff;font-weight:800;font-size:18px;box-shadow:0 8px 18px #315efb44}.eyebrow{text-transform:uppercase;letter-spacing:.11em;font-weight:750;font-size:11px;color:var(--blue);margin:0 0 2px}.top h1{font-size:25px;line-height:1.1;margin:0;letter-spacing:-.03em}.top p{margin:7px 0 0;color:var(--muted)}
-    .badge{white-space:nowrap;display:flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid #bfe9d5;background:var(--green-bg);border-radius:999px;color:var(--green);font-weight:700}.dot{width:8px;height:8px;border-radius:99px;background:#1ca66f;box-shadow:0 0 0 4px #1ca66f20}
-    .hero{background:linear-gradient(120deg,#152958,#253e92 58%,#315efb);border-radius:22px;color:#fff;padding:31px 33px;box-shadow:var(--shadow);display:flex;justify-content:space-between;gap:25px;align-items:center}.hero h2{font-size:25px;letter-spacing:-.025em;line-height:1.18;margin:0 0 9px}.hero p{margin:0;color:#dce7ff;max-width:630px}.next{background:#ffffff18;border:1px solid #ffffff28;border-radius:13px;padding:13px 15px;min-width:250px;font-size:13px}.next strong{display:block;margin-bottom:3px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#adc7ff}
-    .grid{display:grid;grid-template-columns:1.35fr .85fr;gap:20px;margin-top:20px}.panel{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 3px 12px rgba(32,55,90,.025)}.panel h2{font-size:18px;letter-spacing:-.015em;margin:0}.panel .sub{color:var(--muted);margin:5px 0 20px}
-    .status-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.metric{padding:15px;border:1px solid var(--line);border-radius:13px;background:#fbfcfe}.metric .label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px}.metric .value{font-weight:750;font-size:14px;word-break:break-word}.online{color:var(--green)}.mono{font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}
-    .endpoint{display:flex;align-items:center;gap:8px;margin-top:17px;border:1px solid #dbe4ff;background:#f3f6ff;border-radius:13px;padding:11px 12px}.endpoint code{color:#1c3fa5;overflow:auto;white-space:nowrap;flex:1}.copy{border:0;border-radius:9px;background:#fff;color:var(--blue);font-weight:700;cursor:pointer;padding:7px 10px;box-shadow:0 1px 4px #264fa822}.copy:hover{background:#e9efff}
-    .connection{margin-top:19px;border-radius:13px;padding:13px 14px;display:flex;gap:10px;align-items:flex-start}.connection.ready{background:var(--green-bg);color:#125f42}.connection.pending{background:var(--amber-bg);color:#874600}.connection b{display:block}.connection p{margin:2px 0 0;font-size:13px}
-    .form{display:grid;gap:14px}.field{display:grid;gap:6px}.field label{font-weight:700;font-size:13px}.field input{width:100%;border:1px solid #cfd7e6;border-radius:10px;padding:10px 11px;font:14px ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--ink);outline:none}.field input:focus{border-color:var(--blue);box-shadow:0 0 0 3px #315efb18}.field small{color:var(--muted);font-size:12px}.actions{display:flex;gap:9px;align-items:center;margin-top:3px}.primary,.secondary{border:0;border-radius:10px;padding:10px 13px;font-weight:750;cursor:pointer}.primary{background:var(--blue);color:#fff}.primary:hover{background:var(--blue-dark)}.primary:disabled{opacity:.58;cursor:wait}.secondary{background:#eef2ff;color:#274bb5}.result{display:none;margin-top:15px;padding:12px 13px;border-radius:10px;font-size:13px}.result.show{display:block}.result.success{background:var(--green-bg);color:#125f42}.result.error{background:#fff0ef;color:#a13227}.hint{margin-top:19px;padding:14px 15px;border-radius:12px;background:#f6f8fc;color:#536076;font-size:13px}.hint b{color:var(--ink)}
-    .details{margin-top:20px}.details summary{cursor:pointer;color:#536076;font-weight:650}.details ul{padding-left:19px;color:var(--muted);font-size:13px}.links{display:flex;flex-wrap:wrap;gap:9px;margin-top:18px}.link{display:inline-flex;align-items:center;gap:5px;padding:7px 10px;border:1px solid var(--line);border-radius:9px;color:#40506e;text-decoration:none;font-size:13px;font-weight:650}.link:hover{border-color:#afc2ff;color:var(--blue)}
-    @media(max-width:800px){.top,.hero{display:block}.badge{margin-top:15px;width:max-content}.hero{padding:25px}.next{margin-top:17px}.grid{grid-template-columns:1fr}.status-cards{grid-template-columns:1fr}.wrap{padding:20px 14px 40px}}
-  </style>
-</head>
-<body>
-  <main class="wrap">
-    <header class="top">
-      <div class="brand"><div class="mark">V</div><div><p class="eyebrow">Local-first MCP</p><h1>Vibecode Control Center</h1><p>Trung tâm vận hành MCP trên máy của bạn.</p></div></div>
-      <div class="badge"><i class="dot"></i>Server đang hoạt động</div>
-    </header>
-    <section class="hero"><div><h2>Máy chủ đã sẵn sàng.</h2><p>Hoàn tất ba bước dưới đây để ChatGPT có thể sử dụng workspace cục bộ này qua OpenAI Secure MCP Tunnel.</p></div><div class="next"><strong>Bước tiếp theo</strong>${escapeHtml(nextAction)}</div></section>
-    <div class="grid">
-      <section class="panel"><h2>Trạng thái hiện tại</h2><p class="sub">Dịch vụ chỉ lắng nghe trên máy này — không được public ra Internet.</p>
-        <div class="status-cards"><div class="metric"><span class="label">MCP server</span><span class="value online">● Đang hoạt động</span></div><div class="metric"><span class="label">Workspace</span><span class="value mono">${escapeHtml(WORKSPACE)}</span></div><div class="metric"><span class="label">Chính sách lệnh</span><span class="value">${escapeHtml(SHELL_MODE)}</span></div></div>
-        <div class="endpoint"><code id="endpoint">${escapeHtml(endpoint)}</code><button class="copy" type="button" data-copy="endpoint">Sao chép</button></div>
-        <div class="connection ${connectionClass}"><span>${setupReady ? '✓' : '!'}</span><div><b id="connection-label">${connectionLabel}</b><p id="connection-detail">Tunnel: ${status.tunnel.configured ? 'đã cấu hình' : 'chưa cấu hình'} · tunnel-client: ${status.tunnel.clientInstalled ? 'đã cài' : 'chưa cài'}</p></div></div>
-        <div class="links"><a class="link" href="/healthz" target="_blank">Health check</a><a class="link" href="/readyz" target="_blank">Readiness check</a><a class="link" href="/api/status" target="_blank">Status JSON</a></div>
-        <details class="details"><summary>Thông tin kỹ thuật</summary><ul><li>Alias Tunnel: <code>${escapeHtml(status.tunnel.alias)}</code></li><li>Tiến trình MCP quản lý: <span id="process-count">${status.processes.length}</span></li><li>Công cụ đã gọi: <span id="tool-count">${Object.values(status.toolsCalled).reduce((total, count) => total + count, 0)}</span></li></ul></details>
-      </section>
-      <aside class="panel"><h2>Kết nối Secure Tunnel</h2><p class="sub">Kết nối trực tiếp từ máy này, sau đó thêm Tunnel vào ChatGPT.</p>
-        <form class="form" id="tunnel-form" autocomplete="off"><div class="field"><label for="tunnel-id">Tunnel ID</label><input id="tunnel-id" name="tunnelId" required placeholder="tunnel_..." value="${escapeHtml(status.tunnel.configured ? TUNNEL_ID : '')}"><small>Tạo Tunnel trong <a href="https://platform.openai.com/settings/organization/tunnels" target="_blank" rel="noreferrer">OpenAI Platform</a>.</small></div><div class="field"><label for="tunnel-alias">Tên kết nối (alias)</label><input id="tunnel-alias" name="alias" required value="${escapeHtml(status.tunnel.alias)}"></div><div class="field"><label for="runtime-key">Runtime API key</label><input id="runtime-key" name="runtimeApiKey" type="password" required placeholder="Nhập key có quyền Tunnels Read + Use"><small>Chỉ gửi qua loopback để chạy tunnel-client; không lưu file, không hiển thị lại.</small></div><div class="actions"><button class="primary" id="connect-button" type="submit">Kết nối Tunnel</button><button class="secondary" id="disconnect-button" type="button">Ngắt kết nối</button></div></form>
-        <div class="result" id="tunnel-result" role="status"></div>
-        <div class="hint"><b>Sau khi kết nối:</b> Vào <b>ChatGPT → Settings → Connectors → Add/configure MCP connector → Connection: Tunnel</b>, rồi chọn Tunnel ID này. Nếu chỉ xem giao diện, bạn không cần Tunnel.</div>
-      </aside>
-    </div>
-  </main>
-  <script>
-    document.querySelector('[data-copy]').addEventListener('click', async (event) => { const button = event.currentTarget; try { await navigator.clipboard.writeText(document.getElementById(button.dataset.copy).textContent); button.textContent = 'Đã sao chép'; setTimeout(() => button.textContent = 'Sao chép', 1600); } catch { button.textContent = 'Hãy sao chép tay'; } });
-    const tunnelForm = document.getElementById('tunnel-form'); const connectButton = document.getElementById('connect-button'); const disconnectButton = document.getElementById('disconnect-button'); const tunnelResult = document.getElementById('tunnel-result');
-    function showTunnelResult(message, type = 'success') { tunnelResult.textContent = message; tunnelResult.className = 'result show ' + type; }
-    function renderTunnel(tunnel) { const connected = tunnel.runtimeStatus === 'connected'; const connecting = tunnel.runtimeStatus === 'connecting' || tunnel.runtimeStatus === 'disconnecting'; document.getElementById('connection-label').textContent = connected ? 'Tunnel đã kết nối' : connecting ? 'Tunnel đang xử lý' : tunnel.runtimeStatus === 'failed' ? 'Tunnel gặp lỗi' : '${connectionLabel}'; document.getElementById('connection-detail').textContent = tunnel.lastMessage || ('Tunnel: ' + (tunnel.configured ? 'đã cấu hình' : 'chưa cấu hình') + ' · tunnel-client: ' + (tunnel.clientInstalled ? 'đã cài' : 'chưa cài')); disconnectButton.disabled = !(connecting || connected); }
-    tunnelForm.addEventListener('submit', async event => { event.preventDefault(); const data = Object.fromEntries(new FormData(tunnelForm)); connectButton.disabled = true; connectButton.textContent = 'Đang kết nối…'; try { const response = await fetch('/api/tunnel/connect', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) }); const result = await response.json(); if (!response.ok) throw new Error(result.error || 'Không thể kết nối Tunnel.'); showTunnelResult('Đã gửi yêu cầu kết nối. Trạng thái sẽ tự cập nhật.', 'success'); renderTunnel(result.tunnel); } catch (error) { showTunnelResult(error.message, 'error'); } finally { document.getElementById('runtime-key').value = ''; connectButton.disabled = false; connectButton.textContent = 'Kết nối Tunnel'; } });
-    disconnectButton.addEventListener('click', async () => { try { const response = await fetch('/api/tunnel/disconnect', { method: 'POST' }); const result = await response.json(); if (!response.ok) throw new Error(result.error || 'Không thể ngắt Tunnel.'); renderTunnel(result.tunnel); showTunnelResult(result.tunnel.lastMessage, 'success'); } catch (error) { showTunnelResult(error.message, 'error'); } });
-    async function refreshStatus() { try { const data = await fetch('/api/status', { cache: 'no-store' }).then(r => r.json()); document.getElementById('process-count').textContent = data.processes.length; document.getElementById('tool-count').textContent = Object.values(data.toolsCalled).reduce((total, count) => total + count, 0); renderTunnel(data.tunnel); } catch {} }
-    refreshStatus();
-    setInterval(refreshStatus, 10000);
-  </script>
-</body>
-</html>`;
-}
-
-function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c])); }
+app.get('/', async (_req, res) => {
+  try { res.type('html').send(await fsp.readFile(path.join(PROJECT_ROOT, 'src', 'control-center.html'), 'utf8')); }
+  catch (error) { res.status(500).type('text').send(error instanceof Error ? error.message : String(error)); }
+});
 
 const httpServer = app.listen(PORT, HOST, () => {
   console.log(`[vibecode-mcp] listening on http://${HOST}:${PORT}`);

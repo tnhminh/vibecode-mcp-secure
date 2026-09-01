@@ -153,7 +153,7 @@ CONFIGURE.cmd
 
 ## 8) Giới hạn của bản bridge-ready
 
-Bản này phù hợp để vibecode trên máy cá nhân/repo tin cậy. Nó chưa phải hardened multi-user/24x7 production service. Đặc biệt chưa có canonical symlink/junction sandbox, local MCP auth v2, persistent process recovery, audit hash-chain và full security test suite.
+Bản này phù hợp để vibecode trên máy cá nhân/repo tin cậy. Canonical symlink/junction workspace checks và audit content redaction đã có regression test. Nó vẫn chưa phải hardened multi-user/24x7 production service; còn thiếu granular project permission engine, local MCP auth v2, persistent process recovery, audit hash-chain và full security test suite.
 
 Để an toàn, giữ mặc định:
 

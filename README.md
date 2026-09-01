@@ -16,7 +16,8 @@ This project intentionally keeps the architecture simple:
 - Local Streamable HTTP MCP endpoint: `http://127.0.0.1:7317/mcp`
 - Official OpenAI `tunnel-client` installer/launcher
 - `runtimes connect` + `runtimes status`
-- `/healthz`, `/readyz`, local Control Center
+- `/healthz`, `/readyz`, local Operations Control Center
+- runtime Overview for workspace, Git, processes, verification, activity, security and Tunnel state
 
 ### Layer 2 — Execution Runtime
 
@@ -44,12 +45,12 @@ LSP/AST semantic navigation is left as the next extension point rather than ship
 
 ### Layer 5 — Safety / Observability
 
-- workspace path boundary enforcement for filesystem tools
-- shell command allowlist by default
+- canonical workspace boundary enforcement, including symlink/junction escape checks
+- shell command allowlist by default, including Windows command-chaining regression protection
 - explicit dangerous-command deny rules
 - external browser URLs blocked by default
-- NDJSON audit log with secret redaction
-- Control Center and status endpoint
+- NDJSON audit log with recursive secret/source-content redaction
+- Operations Control Center and enriched status endpoint
 
 ### Layer 6 — Harness / Skills
 

@@ -1,15 +1,35 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const envFile = path.join(root, '.env');
 const backup = fs.existsSync(envFile) ? fs.readFileSync(envFile) : null;
-fs.writeFileSync(envFile, `VIBECODE_WORKSPACE=${root}\nVIBECODE_HOST=127.0.0.1\nVIBECODE_PORT=17317\nVIBECODE_SHELL_MODE=allowlist\n`);
+const selftestPort = 17417;
+const outsideTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'vibecode-selftest-'));
+const junction = path.join(root, '.vibecode-artifacts', 'selftest-outside-junction');
+fs.mkdirSync(path.dirname(junction), { recursive: true });
+fs.rmSync(junction, { recursive: true, force: true });
+fs.writeFileSync(path.join(outsideTemp, 'outside.txt'), 'outside-workspace', 'utf8');
+fs.symlinkSync(outsideTemp, junction, process.platform === 'win32' ? 'junction' : 'dir');
+fs.writeFileSync(envFile, `VIBECODE_WORKSPACE=${root}\nVIBECODE_HOST=127.0.0.1\nVIBECODE_PORT=${selftestPort}\nVIBECODE_SHELL_MODE=allowlist\n`);
 
-const child = spawn(process.execPath, ['src/server.mjs'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+const child = spawn(process.execPath, ['src/server.mjs'], {
+  cwd: root,
+  stdio: ['ignore', 'pipe', 'pipe'],
+  env: {
+    ...process.env,
+    VIBECODE_WORKSPACE: root,
+    VIBECODE_HOST: '127.0.0.1',
+    VIBECODE_PORT: String(selftestPort),
+    VIBECODE_SHELL_MODE: 'allowlist',
+    VIBECODE_ALLOW_DANGEROUS: '0',
+    VIBECODE_BROWSER_ALLOW_EXTERNAL: '0'
+  }
+});
 let stderr = '';
 child.stderr.on('data', d => stderr += d.toString());
 let client;
@@ -18,27 +38,27 @@ try {
   for (let i = 0; i < 40; i++) {
     await new Promise(r => setTimeout(r, 200));
     try {
-      const res = await fetch('http://127.0.0.1:17317/healthz');
+      const res = await fetch(`http://127.0.0.1:${selftestPort}/healthz`);
       if (res.ok) { ok = true; break; }
     } catch {}
   }
   if (!ok) throw new Error(`Server did not become healthy. ${stderr}`);
 
-  const ready = await fetch('http://127.0.0.1:17317/readyz');
+  const ready = await fetch(`http://127.0.0.1:${selftestPort}/readyz`);
   if (!ready.ok) throw new Error(`readyz failed: ${await ready.text()}`);
 
-  const controlCenter = await fetch('http://127.0.0.1:17317/');
+  const controlCenter = await fetch(`http://127.0.0.1:${selftestPort}/`);
   const controlCenterHtml = await controlCenter.text();
-  if (!controlCenter.ok || !controlCenterHtml.includes('Kết nối Secure Tunnel')) throw new Error('Control Center did not render Tunnel connection UI.');
+  if (!controlCenter.ok || !controlCenterHtml.includes('Operations Console') || !controlCenterHtml.includes('Git & Verification')) throw new Error('Control Center did not render Operations Console UI.');
 
-  const invalidTunnel = await fetch('http://127.0.0.1:17317/api/tunnel/connect', {
+  const invalidTunnel = await fetch(`http://127.0.0.1:${selftestPort}/api/tunnel/connect`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ tunnelId: 'not-a-tunnel', alias: 'selftest', runtimeApiKey: '' })
   });
   if (invalidTunnel.status !== 400) throw new Error(`Tunnel connection validation returned ${invalidTunnel.status}, expected 400.`);
 
   client = new Client({ name: 'vibecode-selftest', version: '1.0.0' }, { versionNegotiation: { mode: 'auto' } });
-  const transport = new StreamableHTTPClientTransport(new URL('http://127.0.0.1:17317/mcp'));
+  const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${selftestPort}/mcp`));
   await client.connect(transport);
   const { tools } = await client.listTools();
   const names = new Set(tools.map(t => t.name));
@@ -48,9 +68,30 @@ try {
   const health = await client.callTool({ name: 'health', arguments: {} });
   if (health.isError) throw new Error(`health tool returned error: ${JSON.stringify(health.content)}`);
 
-  console.log(`SELFTEST PASS: HTTP health + MCP ${client.getProtocolEra() || 'negotiated'} + ${tools.length} tools`);
+  const directDenied = await client.callTool({ name: 'run_command', arguments: { command: 'whoami' } });
+  if (!directDenied.isError) throw new Error('Shell allowlist regression: direct blocked executable was allowed.');
+  const chainedDenied = await client.callTool({ name: 'run_command', arguments: { command: 'node --version & whoami' } });
+  if (!chainedDenied.isError) throw new Error('Shell allowlist regression: single-& command chaining bypass was allowed.');
+
+  const junctionDenied = await client.callTool({ name: 'read_file', arguments: { path: '.vibecode-artifacts/selftest-outside-junction/outside.txt' } });
+  if (!junctionDenied.isError) throw new Error('Workspace regression: junction escape was allowed.');
+
+  const auditProbe = 'selftest-sensitive-content-' + Date.now();
+  const writeProbe = await client.callTool({ name: 'write_file', arguments: { path: '.vibecode-artifacts/selftest-audit.txt', content: auditProbe } });
+  if (writeProbe.isError) throw new Error('Audit redaction probe write failed.');
+  const auditTail = await client.callTool({ name: 'audit_tail', arguments: { limit: 20 } });
+  if (JSON.stringify(auditTail).includes(auditProbe)) throw new Error('Audit regression: file content leaked into audit output.');
+  await client.callTool({ name: 'delete_path', arguments: { path: '.vibecode-artifacts/selftest-audit.txt', confirm: true } });
+
+  const status = await fetch(`http://127.0.0.1:${selftestPort}/api/status`);
+  const statusJson = await status.json();
+  if (!status.ok || !statusJson.security || !statusJson.processes || !statusJson.activity) throw new Error('Operations status API is incomplete.');
+
+  console.log(`SELFTEST PASS: HTTP health + Operations Console + MCP ${client.getProtocolEra() || 'negotiated'} + ${tools.length} tools + shell/junction/audit security regressions`);
 } finally {
   try { await client?.close(); } catch {}
   child.kill('SIGTERM');
+  fs.rmSync(junction, { recursive: true, force: true });
+  fs.rmSync(outsideTemp, { recursive: true, force: true });
   if (backup === null) fs.rmSync(envFile, { force: true }); else fs.writeFileSync(envFile, backup);
 }
