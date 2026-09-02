@@ -77,6 +77,13 @@ Write-Host "Running local MCP protocol self-test..."
 & npm run selftest
 if ($LASTEXITCODE -ne 0) { throw "MCP self-test failed." }
 
+$Launcher = Join-Path $Root 'VibecodeMCP.exe'
+if (Test-Path $Launcher) {
+  Write-Host "Running Windows launcher self-test..."
+  & $Launcher --self-test
+  if ($LASTEXITCODE -ne 0) { throw "VibecodeMCP.exe self-test failed." }
+}
+
 Write-Host ""
 Write-Host "SETUP COMPLETE" -ForegroundColor Green
-Write-Host "Next: run CONFIGURE.cmd, then START.cmd"
+Write-Host "Next: double-click VibecodeMCP.exe or run FIRST-RUN.cmd for guided configuration."

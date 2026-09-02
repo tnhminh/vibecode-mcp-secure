@@ -3,14 +3,14 @@
 ## Default protections
 
 - MCP binds to loopback (`127.0.0.1`).
-- Filesystem operations enforce one canonical workspace root and reject symlink/junction escapes.
+- Filesystem operations enforce a separate canonical workspace root for each approved project and reject symlink/junction escapes.
 - `delete_path` cannot delete the workspace root and requires explicit `confirm=true`.
 - `git_restore` requires explicit `confirm=true`.
 - shell runs in `allowlist` mode by default.
 - high-risk command patterns are denied unless `VIBECODE_ALLOW_DANGEROUS=1`.
 - external browser URLs are blocked unless `VIBECODE_BROWSER_ALLOW_EXTERNAL=1`.
 - audit arguments recursively redact keys/tokens/secrets/passwords/authorization and omit source-content fields such as content/find/replace/replacement/body.
-- Runtime API key is not stored by the generated `.env` flow.
+- Runtime API key is never stored in `.env`. `VibecodeMCP.exe` may store it encrypted with Windows DPAPI under `.runtime`, scoped to the current Windows user; use `VibecodeMCP.exe --reset-key` to remove it.
 - Project Add/Remove/permission changes are accepted only from the loopback Control Center.
 - MCP project routing can only target already-approved registry entries; `project_set_default` / legacy `project_switch` only change the default fallback and cannot register arbitrary filesystem paths.
 

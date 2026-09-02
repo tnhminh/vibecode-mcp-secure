@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
+    "build:launcher": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Build-WindowsLauncher.ps1",
     "check": "node --check src/server.mjs && node --check scripts/selftest.mjs",
     "selftest": "node scripts/selftest.mjs"
   },

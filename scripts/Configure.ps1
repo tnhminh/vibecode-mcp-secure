@@ -2,7 +2,7 @@ param(
   [string]$Workspace,
   [string]$TunnelId,
   [string]$Alias = 'vibecode-local',
-  [int]$Port = 7317
+  [int]$Port = 1167
 )
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot

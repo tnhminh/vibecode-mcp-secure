@@ -15,7 +15,7 @@ const PROJECT_ROOT = path.resolve(HERE, '..');
 loadEnvFile(path.join(PROJECT_ROOT, '.env'));
 
 const HOST = process.env.VIBECODE_HOST || '127.0.0.1';
-const PORT = Number(process.env.VIBECODE_PORT || 7317);
+const PORT = Number(process.env.VIBECODE_PORT || 1167);
 const INITIAL_WORKSPACE = path.resolve(process.env.VIBECODE_WORKSPACE || process.cwd());
 const MAX_READ_BYTES = Number(process.env.VIBECODE_MAX_READ_BYTES || 262144);
 const MAX_COMMAND_OUTPUT_BYTES = Number(process.env.VIBECODE_MAX_COMMAND_OUTPUT_BYTES || 262144);

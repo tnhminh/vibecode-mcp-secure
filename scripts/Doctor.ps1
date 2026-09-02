@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Continue'
 $Root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Common.ps1')
 Import-DotEnv (Join-Path $Root '.env')
-$Port = if ($env:VIBECODE_PORT) { [int]$env:VIBECODE_PORT } else { 7317 }
+$Port = if ($env:VIBECODE_PORT) { [int]$env:VIBECODE_PORT } else { 1167 }
 $TunnelExe = Join-Path $Root 'bin\tunnel-client.exe'
 $Alias = if ($env:TUNNEL_ALIAS) { $env:TUNNEL_ALIAS } else { 'vibecode-local' }
 

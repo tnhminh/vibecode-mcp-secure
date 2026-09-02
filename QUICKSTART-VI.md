@@ -32,7 +32,7 @@ Sau đó double-click:
 FIRST-RUN.cmd
 ```
 
-Script sẽ lần lượt chạy Setup → Configure → Start.
+Script sẽ chạy Setup → cấu hình launcher → start. Sau lần đầu, chỉ cần double-click `VibecodeMCP.exe`.
 
 ### Khi Configure hỏi workspace
 
@@ -60,17 +60,27 @@ Dùng Restricted Runtime API key có quyền:
 Tunnels Read + Use
 ```
 
-Key này chỉ được nhập lúc chạy và không được ghi vào `.env`.
+Key không được ghi vào `.env`. Với launcher EXE, key có thể được nhập một lần rồi lưu mã hóa bằng Windows DPAPI trong `.runtime`, chỉ tài khoản Windows hiện tại giải mã được.
+
+### Launcher EXE
+
+Sau khi SETUP xong, có thể chạy trực tiếp:
+
+```text
+VibecodeMCP.exe
+```
+
+Các lệnh tiện dụng: `--status`, `--stop`, `--configure`, `--reset-key`, `--self-test`, `--no-open`.
 
 ## 3) Kiểm tra MCP local
 
 Sau khi start thành công:
 
 ```text
-Control Center: http://127.0.0.1:7317/
-Health:         http://127.0.0.1:7317/healthz
-Ready:          http://127.0.0.1:7317/readyz
-MCP endpoint:   http://127.0.0.1:7317/mcp
+Control Center: http://127.0.0.1:1167/
+Health:         http://127.0.0.1:1167/healthz
+Ready:          http://127.0.0.1:1167/readyz
+MCP endpoint:   http://127.0.0.1:1167/mcp
 ```
 
 Nếu có lỗi, chạy:
@@ -118,11 +128,13 @@ review git diff và báo kết quả. Không commit nếu tôi chưa yêu cầu.
 
 ## 6) Workflow dùng hằng ngày
 
-Start:
+Start (khuyến nghị):
 
 ```text
-START.cmd
+VibecodeMCP.exe
 ```
+
+`START.cmd` cũng tự gọi EXE nếu file tồn tại.
 
 Diagnose:
 

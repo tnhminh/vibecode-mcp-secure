@@ -7,10 +7,19 @@ echo ==================================================
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\Setup.ps1"
 if errorlevel 1 goto :fail
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\Configure.ps1"
-if errorlevel 1 goto :fail
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\Start-Vibecode.ps1"
-if errorlevel 1 goto :fail
+
+if exist ".\VibecodeMCP.exe" (
+  ".\VibecodeMCP.exe" --configure
+  if errorlevel 1 goto :fail
+  ".\VibecodeMCP.exe"
+  if errorlevel 1 goto :fail
+) else (
+  powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\Configure.ps1"
+  if errorlevel 1 goto :fail
+  powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\Start-Vibecode.ps1"
+  if errorlevel 1 goto :fail
+)
+
 echo.
 echo First run completed successfully.
 pause

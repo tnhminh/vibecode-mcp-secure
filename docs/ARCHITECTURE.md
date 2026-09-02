@@ -19,7 +19,7 @@
                        │ loopback HTTP
                        ▼
 ┌─────────────────────────────────────────────┐
-│ Vibecode MCP :7317                          │
+│ Vibecode MCP :1167                          │
 │                                             │
 │ Layer 2: Files / shell / process / git      │
 │ Layer 3: repo map / search / context        │

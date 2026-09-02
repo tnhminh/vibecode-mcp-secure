@@ -7,7 +7,7 @@ if (-not $env:VIBECODE_WORKSPACE -or $env:VIBECODE_WORKSPACE -match 'your-projec
 if (-not (Test-Path $env:VIBECODE_WORKSPACE -PathType Container)) { throw "Workspace not found: $env:VIBECODE_WORKSPACE" }
 if (-not $env:CONTROL_PLANE_TUNNEL_ID -or $env:CONTROL_PLANE_TUNNEL_ID -match 'REPLACE_ME') { throw "Configure CONTROL_PLANE_TUNNEL_ID first." }
 
-$Port = if ($env:VIBECODE_PORT) { [int]$env:VIBECODE_PORT } else { 7317 }
+$Port = if ($env:VIBECODE_PORT) { [int]$env:VIBECODE_PORT } else { 1167 }
 $Health = "http://127.0.0.1:$Port/healthz"
 $Ready = "http://127.0.0.1:$Port/readyz"
 $McpUrl = "http://127.0.0.1:$Port/mcp"

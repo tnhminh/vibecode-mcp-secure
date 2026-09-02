@@ -13,7 +13,7 @@ This project intentionally keeps the architecture simple:
 
 ### Layer 1 — Transport / Bridge
 
-- Local Streamable HTTP MCP endpoint: `http://127.0.0.1:7317/mcp`
+- Local Streamable HTTP MCP endpoint: `http://127.0.0.1:1167/mcp`
 - Official OpenAI `tunnel-client` installer/launcher
 - `runtimes connect` + `runtimes status`
 - `/healthz`, `/readyz`, local Operations Control Center
@@ -68,13 +68,21 @@ LSP/AST semantic navigation is left as the next extension point rather than ship
 
 ## Fastest path — one click
 
-After extracting the ZIP, double-click:
+For an already prepared installation, double-click:
+
+```text
+VibecodeMCP.exe
+```
+
+The Windows launcher starts/checks the local MCP, waits for health/readiness, reconnects the Secure MCP Tunnel when needed, verifies tunnel status, and opens the Control Center.
+
+For a brand-new machine/install, run once:
 
 ```text
 FIRST-RUN.cmd
 ```
 
-It executes Setup -> Configure -> Start in order and stops immediately if a stage fails.
+It runs Setup, then uses `VibecodeMCP.exe --configure` for one-time workspace/tunnel configuration.
 
 ## 0. Prerequisites
 
@@ -154,34 +162,50 @@ Enter:
 - project workspace, for example `E:\kpi-performance-starter`
 - `tunnel_...` ID
 
-The runtime API key is deliberately not stored in `.env`.
+The runtime API key is deliberately not stored in `.env`. The Windows launcher can store it encrypted with Windows DPAPI under `.runtime`, scoped to the current Windows user.
 
 ## 5. Start everything
 
-Double-click:
+Preferred Windows launcher:
 
 ```text
-START.cmd
+VibecodeMCP.exe
 ```
 
-The script:
+`START.cmd` now delegates to the EXE when it is present and falls back to the PowerShell launcher otherwise.
 
-1. starts the local MCP server in the background;
-2. waits for `/healthz` and `/readyz`;
-3. securely asks for the Runtime API key if it is not already present in the current environment;
-4. runs official `tunnel-client runtimes connect`;
-5. verifies `runtimes status`.
+The EXE:
+
+1. discovers/normalizes the local stable configuration (default port `1167`);
+2. starts the MCP only when it is not already healthy;
+3. waits for `/healthz` and `/readyz`;
+4. reuses an existing tunnel profile when possible;
+5. if credentials are needed, requests the Runtime API key once and stores it encrypted with Windows DPAPI under `.runtime`;
+6. runs official `tunnel-client runtimes connect` when required;
+7. verifies `runtimes status`;
+8. opens the local Control Center.
+
+Useful modes:
+
+```text
+VibecodeMCP.exe --status
+VibecodeMCP.exe --stop
+VibecodeMCP.exe --configure
+VibecodeMCP.exe --reset-key
+VibecodeMCP.exe --self-test
+VibecodeMCP.exe --no-open
+```
 
 Local Control Center:
 
 ```text
-http://127.0.0.1:7317/
+http://127.0.0.1:1167/
 ```
 
 Local MCP endpoint:
 
 ```text
-http://127.0.0.1:7317/mcp
+http://127.0.0.1:1167/mcp
 ```
 
 ## 6. Connect ChatGPT
