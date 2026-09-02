@@ -64,11 +64,13 @@ Key không được ghi vào `.env`. Với launcher EXE, key có thể được 
 
 ### Launcher EXE
 
-Sau khi SETUP xong, có thể chạy trực tiếp:
+Sau khi SETUP xong, chạy trực tiếp app Windows native:
 
 ```text
 VibecodeMCP.exe
 ```
+
+App có giao diện Overview / Projects / Logs / Settings và **không tự mở browser**. Localhost chỉ chạy ngầm làm backend; chỉ nút **Open Web Console** mới mở trình duyệt.
 
 Các lệnh tiện dụng: `--status`, `--stop`, `--configure`, `--reset-key`, `--self-test`, `--no-open`.
 

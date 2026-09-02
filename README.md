@@ -74,7 +74,7 @@ For an already prepared installation, double-click:
 VibecodeMCP.exe
 ```
 
-The Windows launcher starts/checks the local MCP, waits for health/readiness, reconnects the Secure MCP Tunnel when needed, verifies tunnel status, and opens the Control Center.
+The native Windows app starts/checks the local MCP and Secure Tunnel in the background and shows the Control Center directly in a Windows desktop UI. The browser is not opened automatically.
 
 For a brand-new machine/install, run once:
 
@@ -183,7 +183,9 @@ The EXE:
 5. if credentials are needed, requests the Runtime API key once and stores it encrypted with Windows DPAPI under `.runtime`;
 6. runs official `tunnel-client runtimes connect` when required;
 7. verifies `runtimes status`;
-8. opens the local Control Center.
+8. keeps the localhost backend hidden and shows status/projects/logs/settings in the native Windows app. The browser opens only when you explicitly click **Open Web Console**.
+
+The app uses `VibecodeMCP.Cli.exe` as a background helper for start/stop/tunnel operations. You normally launch only `VibecodeMCP.exe`.
 
 Useful modes:
 
