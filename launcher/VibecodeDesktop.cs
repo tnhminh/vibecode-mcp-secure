@@ -662,18 +662,26 @@ internal sealed class MainForm : Form
 
     private void RefreshLogs()
     {
-        var sb = new StringBuilder();
-        sb.AppendLine("=== MCP STDOUT ===");
-        sb.AppendLine(Tail(Path.Combine(runtimeDir, "mcp.stdout.log"), 160));
-        sb.AppendLine();
-        sb.AppendLine("=== MCP STDERR ===");
-        sb.AppendLine(Tail(Path.Combine(runtimeDir, "mcp.stderr.log"), 160));
-        sb.AppendLine();
-        sb.AppendLine("=== SERVER 1167 STDERR ===");
-        sb.AppendLine(Tail(Path.Combine(runtimeDir, "server-1167.stderr.log"), 120));
-        logs.Text = sb.ToString();
-        logs.SelectionStart = logs.TextLength;
-        logs.ScrollToCaret();
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("=== MCP STDOUT ===");
+            sb.AppendLine(Tail(Path.Combine(runtimeDir, "mcp.stdout.log"), 160));
+            sb.AppendLine();
+            sb.AppendLine("=== MCP STDERR ===");
+            sb.AppendLine(Tail(Path.Combine(runtimeDir, "mcp.stderr.log"), 160));
+            sb.AppendLine();
+            sb.AppendLine("=== SERVER 1167 STDERR ===");
+            sb.AppendLine(Tail(Path.Combine(runtimeDir, "server-1167.stderr.log"), 120));
+            logs.Text = sb.ToString();
+            logs.SelectionStart = logs.TextLength;
+            logs.ScrollToCaret();
+        }
+        catch (Exception ex)
+        {
+            logs.Text = "Log refresh unavailable: " + ex.Message;
+            footer.Text = "Log refresh skipped; MCP continues running.";
+        }
     }
 
     private void RunCli(string args, string message)
@@ -867,9 +875,26 @@ internal sealed class MainForm : Form
     private static string Tail(string path, int maxLines)
     {
         if (!File.Exists(path)) return "(not found)";
-        string[] lines = File.ReadAllLines(path);
-        int start = Math.Max(0, lines.Length - maxLines);
-        return String.Join(Environment.NewLine, lines, start, lines.Length - start);
+        try
+        {
+            var lines = new List<string>();
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var reader = new StreamReader(stream, Encoding.UTF8, true))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null) lines.Add(line);
+            }
+            int start = Math.Max(0, lines.Count - maxLines);
+            return String.Join(Environment.NewLine, lines.GetRange(start, lines.Count - start).ToArray());
+        }
+        catch (IOException ex)
+        {
+            return "(log temporarily unavailable: " + ex.Message + ")";
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return "(log access denied: " + ex.Message + ")";
+        }
     }
 
     private static Dictionary<string, string> ReadEnv(string path)
