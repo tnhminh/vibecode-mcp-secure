@@ -12,7 +12,7 @@
 - audit arguments recursively redact keys/tokens/secrets/passwords/authorization and omit source-content fields such as content/find/replace/replacement/body.
 - Runtime API key is not stored by the generated `.env` flow.
 - Project Add/Remove/permission changes are accepted only from the loopback Control Center.
-- MCP `project_switch` can only select an already-approved registry entry; it cannot register arbitrary filesystem paths.
+- MCP project routing can only target already-approved registry entries; `project_set_default` / legacy `project_switch` only change the default fallback and cannot register arbitrary filesystem paths.
 
 ## Regression protections
 
@@ -24,7 +24,7 @@ The self-test verifies that:
 
 ## Project permissions
 
-Each approved project has tool-level switches for Read, Write, Execute, Process, Git Write, Browser, and Delete. These gates are enforced in the MCP tool wrapper and permission failures are audited.
+Each approved project has tool-level switches for Read, Write, Execute, Process, Git Write, Browser, and Delete. All approved projects remain concurrently enabled; every project-scoped tool resolves its own `projectId` (or the default fallback), then enforces that project's gate. Permission failures and resolved project context are audited.
 
 `Execute` is intentionally powerful. If enabled, repository scripts/interpreters still execute with the Windows account's OS permissions and may modify files or Git outside the narrower MCP write/delete/git tool gates. Treat reduced permissions as tool policy, not an OS sandbox. Use a VM/container/low-privilege account for strict isolation.
 

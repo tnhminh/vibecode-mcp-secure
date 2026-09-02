@@ -12,7 +12,7 @@ const selftestPort = 17417;
 const outsideTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'vibecode-selftest-'));
 const runtimeTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'vibecode-runtime-'));
 const projectTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'vibecode-project-'));
-fs.writeFileSync(path.join(projectTemp, 'marker.txt'), 'project-switch-ok', 'utf8');
+fs.writeFileSync(path.join(projectTemp, 'marker.txt'), 'project-router-ok', 'utf8');
 const junction = path.join(root, '.vibecode-artifacts', 'selftest-outside-junction');
 fs.mkdirSync(path.dirname(junction), { recursive: true });
 fs.rmSync(junction, { recursive: true, force: true });
@@ -53,7 +53,7 @@ try {
 
   const controlCenter = await fetch(`http://127.0.0.1:${selftestPort}/`);
   const controlCenterHtml = await controlCenter.text();
-  if (!controlCenter.ok || !controlCenterHtml.includes('Operations Console') || !controlCenterHtml.includes('Git & Verification') || !controlCenterHtml.includes('+ Add Project')) throw new Error('Control Center did not render Operations Console + Project Manager UI.');
+  if (!controlCenter.ok || !controlCenterHtml.includes('Operations Console') || !controlCenterHtml.includes('Git & Verification') || !controlCenterHtml.includes('+ Add Project') || !controlCenterHtml.includes('Set Default')) throw new Error('Control Center did not render Operations Console + Multi-Project Router UI.');
 
   const invalidTunnel = await fetch(`http://127.0.0.1:${selftestPort}/api/tunnel/connect`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -66,7 +66,7 @@ try {
   await client.connect(transport);
   const { tools } = await client.listTools();
   const names = new Set(tools.map(t => t.name));
-  for (const required of ['health', 'project_list', 'project_switch', 'repo_map', 'apply_patch', 'run_command', 'git_diff', 'verify_project', 'browser_open', 'audit_tail']) {
+  for (const required of ['health', 'project_list', 'project_set_default', 'project_switch', 'repo_map', 'apply_patch', 'run_command', 'git_diff', 'verify_project', 'browser_open', 'audit_tail']) {
     if (!names.has(required)) throw new Error(`Required MCP tool missing: ${required}`);
   }
   const health = await client.callTool({ name: 'health', arguments: {} });
@@ -88,8 +88,8 @@ try {
   await client.callTool({ name: 'delete_path', arguments: { path: '.vibecode-artifacts/selftest-audit.txt', confirm: true } });
 
   const projectsBefore = await fetch(`http://127.0.0.1:${selftestPort}/api/projects`).then(r => r.json());
-  const rootProject = projectsBefore.projects.find(p => p.active);
-  if (!rootProject) throw new Error('Project Manager regression: no active initial project.');
+  const rootProject = projectsBefore.projects.find(p => p.default);
+  if (!rootProject) throw new Error('Multi-Project Router regression: no default initial project.');
 
   const addProjectResponse = await fetch(`http://127.0.0.1:${selftestPort}/api/projects`, {
     method: 'POST',
@@ -101,16 +101,20 @@ try {
     })
   });
   const addProjectJson = await addProjectResponse.json();
-  if (!addProjectResponse.ok || !addProjectJson.project?.id) throw new Error(`Project Manager regression: add failed: ${JSON.stringify(addProjectJson)}`);
+  if (!addProjectResponse.ok || !addProjectJson.project?.id) throw new Error(`Multi-Project Router regression: add failed: ${JSON.stringify(addProjectJson)}`);
   const testProjectId = addProjectJson.project.id;
 
-  const switchProject = await client.callTool({ name: 'project_switch', arguments: { projectId: testProjectId } });
-  if (switchProject.isError) throw new Error('Project Manager regression: MCP project_switch failed.');
-  const markerRead = await client.callTool({ name: 'read_file', arguments: { path: 'marker.txt' } });
-  if (markerRead.isError || !JSON.stringify(markerRead).includes('project-switch-ok')) throw new Error('Project Manager regression: active workspace did not switch.');
+  const listAfterAdd = await client.callTool({ name: 'project_list', arguments: {} });
+  if (listAfterAdd.isError || !JSON.stringify(listAfterAdd).includes(testProjectId)) throw new Error('Multi-Project Router regression: approved project missing from project_list.');
 
-  const writeDenied = await client.callTool({ name: 'write_file', arguments: { path: 'blocked.txt', content: 'must-not-write' } });
-  if (!writeDenied.isError) throw new Error('Project permission regression: write=false was not enforced.');
+  const markerRead = await client.callTool({ name: 'read_file', arguments: { projectId: testProjectId, path: 'marker.txt' } });
+  if (markerRead.isError || !JSON.stringify(markerRead).includes('project-router-ok')) throw new Error('Multi-Project Router regression: explicit projectId did not route to secondary project.');
+
+  const defaultStillRoot = await client.callTool({ name: 'project_info', arguments: {} });
+  if (defaultStillRoot.isError || !JSON.stringify(defaultStillRoot).includes(path.basename(root))) throw new Error('Multi-Project Router regression: explicit secondary call unexpectedly changed default project.');
+
+  const writeDenied = await client.callTool({ name: 'write_file', arguments: { projectId: testProjectId, path: 'blocked.txt', content: 'must-not-write' } });
+  if (!writeDenied.isError) throw new Error('Project permission regression: write=false was not enforced on targeted project.');
 
   const permissionResponse = await fetch(`http://127.0.0.1:${selftestPort}/api/projects/${encodeURIComponent(testProjectId)}/permissions`, {
     method: 'PATCH',
@@ -118,19 +122,27 @@ try {
     body: JSON.stringify({ permissions: { write: true, delete: true } })
   });
   if (!permissionResponse.ok) throw new Error('Project permission regression: permission update failed.');
-  const writeAllowed = await client.callTool({ name: 'write_file', arguments: { path: 'allowed.txt', content: 'permission-ok' } });
-  if (writeAllowed.isError) throw new Error('Project permission regression: write=true was not applied.');
+  const writeAllowed = await client.callTool({ name: 'write_file', arguments: { projectId: testProjectId, path: 'allowed.txt', content: 'permission-ok' } });
+  if (writeAllowed.isError) throw new Error('Project permission regression: write=true was not applied to targeted project.');
 
-  const switchBack = await client.callTool({ name: 'project_switch', arguments: { projectId: rootProject.id } });
-  if (switchBack.isError) throw new Error('Project Manager regression: switch back failed.');
+  const setDefault = await client.callTool({ name: 'project_set_default', arguments: { projectId: testProjectId } });
+  if (setDefault.isError) throw new Error('Multi-Project Router regression: project_set_default failed.');
+  const defaultMarker = await client.callTool({ name: 'read_file', arguments: { path: 'marker.txt' } });
+  if (defaultMarker.isError || !JSON.stringify(defaultMarker).includes('project-router-ok')) throw new Error('Multi-Project Router regression: default fallback did not update.');
+
+  const explicitRoot = await client.callTool({ name: 'project_info', arguments: { projectId: rootProject.id } });
+  if (explicitRoot.isError || !JSON.stringify(explicitRoot).includes(path.basename(root))) throw new Error('Multi-Project Router regression: explicit root routing failed after default changed.');
+
+  const setDefaultBack = await client.callTool({ name: 'project_switch', arguments: { projectId: rootProject.id } });
+  if (setDefaultBack.isError) throw new Error('Multi-Project Router regression: backward-compatible project_switch alias failed.');
   const removeResponse = await fetch(`http://127.0.0.1:${selftestPort}/api/projects/${encodeURIComponent(testProjectId)}`, { method: 'DELETE' });
-  if (!removeResponse.ok) throw new Error('Project Manager regression: remove failed.');
+  if (!removeResponse.ok) throw new Error('Multi-Project Router regression: remove failed.');
 
   const status = await fetch(`http://127.0.0.1:${selftestPort}/api/status`);
   const statusJson = await status.json();
   if (!status.ok || !statusJson.security || !statusJson.processes || !statusJson.activity) throw new Error('Operations status API is incomplete.');
 
-  console.log(`SELFTEST PASS: HTTP health + Operations Console + Project Manager + MCP ${client.getProtocolEra() || 'negotiated'} + ${tools.length} tools + permissions/shell/junction/audit regressions`);
+  console.log(`SELFTEST PASS: HTTP health + Operations Console + Multi-Project Router + MCP ${client.getProtocolEra() || 'negotiated'} + ${tools.length} tools + concurrent project routing/permissions/shell/junction/audit regressions`);
 } finally {
   try { await client?.close(); } catch {}
   child.kill('SIGTERM');

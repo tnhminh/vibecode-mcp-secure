@@ -18,7 +18,7 @@ This project intentionally keeps the architecture simple:
 - `runtimes connect` + `runtimes status`
 - `/healthz`, `/readyz`, local Operations Control Center
 - runtime Overview for projects/workspace, Git, processes, verification, activity, security and Tunnel state
-- Project Manager registry: approve multiple local workspaces, switch active project without MCP restart, and persist per-project tool permissions
+- Multi-Project Router registry: approve multiple local workspaces, keep them concurrently enabled, choose a `defaultProjectId`, and persist per-project tool permissions
 
 ### Layer 2 — Execution Runtime
 
@@ -28,6 +28,7 @@ This project intentionally keeps the architecture simple:
 - `start_process`, `process_list`, `process_logs`, `stop_process`
 - Git tools
 - Playwright browser tools
+- all project-scoped tools accept optional `projectId`; omitted `projectId` routes to the default project
 
 ### Layer 3 — Code Intelligence / Context
 
@@ -52,7 +53,7 @@ LSP/AST semantic navigation is left as the next extension point rather than ship
 - external browser URLs blocked by default
 - NDJSON audit log with recursive secret/source-content redaction
 - Operations Control Center and enriched status endpoint
-- project registry with loopback-only Add/Remove/permission changes; MCP can only list/switch already-approved projects
+- project registry with loopback-only Add/Remove/permission changes; MCP can route only to already-approved projects and can change only the default fallback, never widen filesystem scope
 
 ### Layer 6 — Harness / Skills
 

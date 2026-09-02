@@ -1,18 +1,25 @@
 # MCP Tool Reference
 
+## Project routing
+
+All project-scoped tools accept optional `projectId`. If omitted, the runtime routes the call to `defaultProjectId`. Filesystem boundary, permissions, Git cwd, process ownership, browser state, screenshot artifacts, verification state, and audit context are resolved per project.
+
 ## Context and filesystem
 
 ### health
 Runtime configuration and process/tool counters.
 
 ### project_list
-Lists projects already approved from the local Control Center and shows the active project.
+Lists all projects already approved from the local Control Center and shows the `defaultProjectId`. All approved projects remain concurrently enabled.
+
+### project_set_default
+Sets the fallback project used when a project-scoped tool omits `projectId`. It does not disable or switch off other approved projects.
 
 ### project_switch
-Switches to another already-approved project without restarting MCP. It cannot add a new filesystem scope.
+Backward-compatible alias for `project_set_default`. It no longer represents an exclusive active-project switch.
 
 ### project_info
-Workspace/package/Git summary for the active project.
+Workspace/package/Git summary for one approved project. Pass `projectId`; omit it to use the default project.
 
 ### tree
 Compact directory tree with depth and entry limits.
