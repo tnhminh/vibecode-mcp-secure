@@ -10,6 +10,9 @@ const envFile = path.join(root, '.env');
 const backup = fs.existsSync(envFile) ? fs.readFileSync(envFile) : null;
 const selftestPort = 17417;
 const outsideTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'vibecode-selftest-'));
+const runtimeTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'vibecode-runtime-'));
+const projectTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'vibecode-project-'));
+fs.writeFileSync(path.join(projectTemp, 'marker.txt'), 'project-switch-ok', 'utf8');
 const junction = path.join(root, '.vibecode-artifacts', 'selftest-outside-junction');
 fs.mkdirSync(path.dirname(junction), { recursive: true });
 fs.rmSync(junction, { recursive: true, force: true });
@@ -23,6 +26,7 @@ const child = spawn(process.execPath, ['src/server.mjs'], {
   env: {
     ...process.env,
     VIBECODE_WORKSPACE: root,
+    VIBECODE_RUNTIME_DIR: runtimeTemp,
     VIBECODE_HOST: '127.0.0.1',
     VIBECODE_PORT: String(selftestPort),
     VIBECODE_SHELL_MODE: 'allowlist',
@@ -49,7 +53,7 @@ try {
 
   const controlCenter = await fetch(`http://127.0.0.1:${selftestPort}/`);
   const controlCenterHtml = await controlCenter.text();
-  if (!controlCenter.ok || !controlCenterHtml.includes('Operations Console') || !controlCenterHtml.includes('Git & Verification')) throw new Error('Control Center did not render Operations Console UI.');
+  if (!controlCenter.ok || !controlCenterHtml.includes('Operations Console') || !controlCenterHtml.includes('Git & Verification') || !controlCenterHtml.includes('+ Add Project')) throw new Error('Control Center did not render Operations Console + Project Manager UI.');
 
   const invalidTunnel = await fetch(`http://127.0.0.1:${selftestPort}/api/tunnel/connect`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -62,7 +66,7 @@ try {
   await client.connect(transport);
   const { tools } = await client.listTools();
   const names = new Set(tools.map(t => t.name));
-  for (const required of ['health', 'repo_map', 'apply_patch', 'run_command', 'git_diff', 'verify_project', 'browser_open', 'audit_tail']) {
+  for (const required of ['health', 'project_list', 'project_switch', 'repo_map', 'apply_patch', 'run_command', 'git_diff', 'verify_project', 'browser_open', 'audit_tail']) {
     if (!names.has(required)) throw new Error(`Required MCP tool missing: ${required}`);
   }
   const health = await client.callTool({ name: 'health', arguments: {} });
@@ -83,15 +87,56 @@ try {
   if (JSON.stringify(auditTail).includes(auditProbe)) throw new Error('Audit regression: file content leaked into audit output.');
   await client.callTool({ name: 'delete_path', arguments: { path: '.vibecode-artifacts/selftest-audit.txt', confirm: true } });
 
+  const projectsBefore = await fetch(`http://127.0.0.1:${selftestPort}/api/projects`).then(r => r.json());
+  const rootProject = projectsBefore.projects.find(p => p.active);
+  if (!rootProject) throw new Error('Project Manager regression: no active initial project.');
+
+  const addProjectResponse = await fetch(`http://127.0.0.1:${selftestPort}/api/projects`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      name: 'selftest-project',
+      workspace: projectTemp,
+      permissions: { read: true, write: false, execute: false, process: false, gitWrite: false, browser: false, delete: false }
+    })
+  });
+  const addProjectJson = await addProjectResponse.json();
+  if (!addProjectResponse.ok || !addProjectJson.project?.id) throw new Error(`Project Manager regression: add failed: ${JSON.stringify(addProjectJson)}`);
+  const testProjectId = addProjectJson.project.id;
+
+  const switchProject = await client.callTool({ name: 'project_switch', arguments: { projectId: testProjectId } });
+  if (switchProject.isError) throw new Error('Project Manager regression: MCP project_switch failed.');
+  const markerRead = await client.callTool({ name: 'read_file', arguments: { path: 'marker.txt' } });
+  if (markerRead.isError || !JSON.stringify(markerRead).includes('project-switch-ok')) throw new Error('Project Manager regression: active workspace did not switch.');
+
+  const writeDenied = await client.callTool({ name: 'write_file', arguments: { path: 'blocked.txt', content: 'must-not-write' } });
+  if (!writeDenied.isError) throw new Error('Project permission regression: write=false was not enforced.');
+
+  const permissionResponse = await fetch(`http://127.0.0.1:${selftestPort}/api/projects/${encodeURIComponent(testProjectId)}/permissions`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ permissions: { write: true, delete: true } })
+  });
+  if (!permissionResponse.ok) throw new Error('Project permission regression: permission update failed.');
+  const writeAllowed = await client.callTool({ name: 'write_file', arguments: { path: 'allowed.txt', content: 'permission-ok' } });
+  if (writeAllowed.isError) throw new Error('Project permission regression: write=true was not applied.');
+
+  const switchBack = await client.callTool({ name: 'project_switch', arguments: { projectId: rootProject.id } });
+  if (switchBack.isError) throw new Error('Project Manager regression: switch back failed.');
+  const removeResponse = await fetch(`http://127.0.0.1:${selftestPort}/api/projects/${encodeURIComponent(testProjectId)}`, { method: 'DELETE' });
+  if (!removeResponse.ok) throw new Error('Project Manager regression: remove failed.');
+
   const status = await fetch(`http://127.0.0.1:${selftestPort}/api/status`);
   const statusJson = await status.json();
   if (!status.ok || !statusJson.security || !statusJson.processes || !statusJson.activity) throw new Error('Operations status API is incomplete.');
 
-  console.log(`SELFTEST PASS: HTTP health + Operations Console + MCP ${client.getProtocolEra() || 'negotiated'} + ${tools.length} tools + shell/junction/audit security regressions`);
+  console.log(`SELFTEST PASS: HTTP health + Operations Console + Project Manager + MCP ${client.getProtocolEra() || 'negotiated'} + ${tools.length} tools + permissions/shell/junction/audit regressions`);
 } finally {
   try { await client?.close(); } catch {}
   child.kill('SIGTERM');
   fs.rmSync(junction, { recursive: true, force: true });
   fs.rmSync(outsideTemp, { recursive: true, force: true });
+  fs.rmSync(runtimeTemp, { recursive: true, force: true });
+  fs.rmSync(projectTemp, { recursive: true, force: true });
   if (backup === null) fs.rmSync(envFile, { force: true }); else fs.writeFileSync(envFile, backup);
 }

@@ -5,8 +5,14 @@
 ### health
 Runtime configuration and process/tool counters.
 
+### project_list
+Lists projects already approved from the local Control Center and shows the active project.
+
+### project_switch
+Switches to another already-approved project without restarting MCP. It cannot add a new filesystem scope.
+
 ### project_info
-Workspace/package/Git summary.
+Workspace/package/Git summary for the active project.
 
 ### tree
 Compact directory tree with depth and entry limits.

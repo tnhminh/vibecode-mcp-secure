@@ -16,22 +16,27 @@ loadEnvFile(path.join(PROJECT_ROOT, '.env'));
 
 const HOST = process.env.VIBECODE_HOST || '127.0.0.1';
 const PORT = Number(process.env.VIBECODE_PORT || 7317);
-const WORKSPACE = path.resolve(process.env.VIBECODE_WORKSPACE || process.cwd());
-const CANONICAL_WORKSPACE = fs.existsSync(WORKSPACE) ? fs.realpathSync(WORKSPACE) : WORKSPACE;
+const INITIAL_WORKSPACE = path.resolve(process.env.VIBECODE_WORKSPACE || process.cwd());
+let WORKSPACE = INITIAL_WORKSPACE;
+let CANONICAL_WORKSPACE = fs.existsSync(WORKSPACE) ? fs.realpathSync(WORKSPACE) : WORKSPACE;
 const MAX_READ_BYTES = Number(process.env.VIBECODE_MAX_READ_BYTES || 262144);
 const MAX_COMMAND_OUTPUT_BYTES = Number(process.env.VIBECODE_MAX_COMMAND_OUTPUT_BYTES || 262144);
 const SHELL_MODE = process.env.VIBECODE_SHELL_MODE || 'allowlist';
 const ALLOW_DANGEROUS = process.env.VIBECODE_ALLOW_DANGEROUS === '1';
 const BROWSER_ALLOW_EXTERNAL = process.env.VIBECODE_BROWSER_ALLOW_EXTERNAL === '1';
-const RUNTIME_DIR = path.join(PROJECT_ROOT, '.runtime');
+const RUNTIME_DIR = path.resolve(process.env.VIBECODE_RUNTIME_DIR || path.join(PROJECT_ROOT, '.runtime'));
 const AUDIT_FILE = path.join(RUNTIME_DIR, 'audit.ndjson');
-const ARTIFACT_DIR = path.join(WORKSPACE, '.vibecode-artifacts');
+let ARTIFACT_DIR = path.join(WORKSPACE, '.vibecode-artifacts');
 const TUNNEL_ID = process.env.CONTROL_PLANE_TUNNEL_ID || '';
 const TUNNEL_ALIAS = process.env.TUNNEL_ALIAS || 'vibecode-local';
 const TUNNEL_CLIENT = path.join(PROJECT_ROOT, 'bin', 'tunnel-client.exe');
+const PROJECTS_FILE = path.join(RUNTIME_DIR, 'projects.json');
+const DEFAULT_PROJECT_PERMISSIONS = Object.freeze({ read: true, write: true, execute: true, process: true, gitWrite: true, browser: true, delete: true });
+const SAFE_NEW_PROJECT_PERMISSIONS = Object.freeze({ read: true, write: true, execute: true, process: true, gitWrite: false, browser: true, delete: false });
 
 await fsp.mkdir(RUNTIME_DIR, { recursive: true });
-await fsp.mkdir(ARTIFACT_DIR, { recursive: true }).catch(() => {});
+let projectRegistry = loadProjectRegistry();
+await activateProjectRecord(projectRegistry.activeProjectId, { persist: false, closeBrowser: false });
 
 const ignoredDirs = new Set(['.git', 'node_modules', '.next', 'dist', 'build', 'coverage', '.turbo', '.cache', '.venv', 'venv']);
 const processRegistry = new Map();
@@ -46,6 +51,149 @@ let tunnelRuntime = {
   lastMessage: 'Chưa có kết nối Tunnel nào được khởi chạy.',
   startedAt: null
 };
+
+
+function normalizePermissions(input = {}) {
+  const out = {};
+  for (const [key, fallback] of Object.entries(DEFAULT_PROJECT_PERMISSIONS)) {
+    out[key] = typeof input[key] === 'boolean' ? input[key] : fallback;
+  }
+  return out;
+}
+
+function makeProjectRecord({ id = randomUUID(), name, workspace, permissions = {} }) {
+  const resolved = path.resolve(workspace);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+    throw new Error(`Project workspace does not exist or is not a directory: ${workspace}`);
+  }
+  const canonical = fs.realpathSync(resolved);
+  return {
+    id,
+    name: String(name || path.basename(resolved)).trim() || path.basename(resolved),
+    workspace: resolved,
+    canonicalWorkspace: canonical,
+    permissions: normalizePermissions(permissions),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function loadProjectRegistry() {
+  let parsed = null;
+  if (fs.existsSync(PROJECTS_FILE)) {
+    try { parsed = JSON.parse(fs.readFileSync(PROJECTS_FILE, 'utf8')); } catch {}
+  }
+  const initial = makeProjectRecord({ name: path.basename(INITIAL_WORKSPACE), workspace: INITIAL_WORKSPACE });
+  const projects = Array.isArray(parsed?.projects) ? parsed.projects.map(p => {
+    try {
+      const record = makeProjectRecord({
+        id: p.id,
+        name: p.name,
+        workspace: p.workspace,
+        permissions: p.permissions
+      });
+      record.createdAt = p.createdAt || record.createdAt;
+      record.updatedAt = p.updatedAt || record.updatedAt;
+      return record;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean) : [];
+  if (!projects.some(p => p.canonicalWorkspace === initial.canonicalWorkspace)) projects.unshift(initial);
+  const activeProjectId = projects.some(p => p.id === parsed?.activeProjectId)
+    ? parsed.activeProjectId
+    : (projects.find(p => p.canonicalWorkspace === initial.canonicalWorkspace)?.id || projects[0].id);
+  return { version: 1, activeProjectId, projects };
+}
+
+async function saveProjectRegistry() {
+  const payload = {
+    version: 1,
+    activeProjectId: projectRegistry.activeProjectId,
+    projects: projectRegistry.projects.map(({ canonicalWorkspace, ...project }) => project)
+  };
+  const temp = PROJECTS_FILE + '.tmp';
+  await fsp.writeFile(temp, JSON.stringify(payload, null, 2) + os.EOL, 'utf8');
+  await fsp.rename(temp, PROJECTS_FILE);
+}
+
+function activeProject() {
+  const project = projectRegistry.projects.find(p => p.id === projectRegistry.activeProjectId);
+  if (!project) throw new Error('No active project is configured.');
+  return project;
+}
+
+async function activateProjectRecord(id, { persist = true, closeBrowser = true } = {}) {
+  const project = projectRegistry.projects.find(p => p.id === id);
+  if (!project) throw new Error(`Unknown project id: ${id}`);
+  const resolved = path.resolve(project.workspace);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) throw new Error(`Project workspace unavailable: ${resolved}`);
+  WORKSPACE = resolved;
+  CANONICAL_WORKSPACE = fs.realpathSync(resolved);
+  ARTIFACT_DIR = path.join(WORKSPACE, '.vibecode-artifacts');
+  await fsp.mkdir(ARTIFACT_DIR, { recursive: true }).catch(() => {});
+  projectRegistry.activeProjectId = id;
+  if (closeBrowser && browserState) {
+    try { await browserState.browser.close(); } catch {}
+    browserState = null;
+  }
+  if (persist) lastVerification = null;
+  if (persist) await saveProjectRegistry();
+  return project;
+}
+
+async function addApprovedProject({ name, workspace, permissions }) {
+  const record = makeProjectRecord({ name, workspace, permissions: permissions ?? SAFE_NEW_PROJECT_PERMISSIONS });
+  if (projectRegistry.projects.some(p => p.canonicalWorkspace === record.canonicalWorkspace)) {
+    throw new Error('Project workspace is already registered.');
+  }
+  projectRegistry.projects.push(record);
+  await saveProjectRegistry();
+  return record;
+}
+
+async function removeApprovedProject(id) {
+  if (projectRegistry.projects.length <= 1) throw new Error('At least one project must remain registered.');
+  const index = projectRegistry.projects.findIndex(p => p.id === id);
+  if (index < 0) throw new Error(`Unknown project id: ${id}`);
+  if (projectRegistry.activeProjectId === id) throw new Error('Cannot remove the active project. Switch to another project first.');
+  if ([...processRegistry.values()].some(p => p.projectId === id && p.status === 'running')) throw new Error('Cannot remove a project while it has running MCP-managed processes.');
+  const [removed] = projectRegistry.projects.splice(index, 1);
+  await saveProjectRegistry();
+  return removed;
+}
+
+async function updateProjectPermissions(id, permissions) {
+  const project = projectRegistry.projects.find(p => p.id === id);
+  if (!project) throw new Error(`Unknown project id: ${id}`);
+  project.permissions = normalizePermissions({ ...project.permissions, ...permissions });
+  project.updatedAt = new Date().toISOString();
+  await saveProjectRegistry();
+  return project;
+}
+
+function requireProjectPermission(permission, action = permission) {
+  const project = activeProject();
+  if (!project.permissions?.[permission]) {
+    throw Object.assign(new Error(`Active project does not allow ${action}.`), { code: 'PERMISSION_DENIED' });
+  }
+  return project;
+}
+
+function projectRegistrySummary() {
+  return {
+    activeProjectId: projectRegistry.activeProjectId,
+    projects: projectRegistry.projects.map(p => ({
+      id: p.id,
+      name: p.name,
+      workspace: p.workspace,
+      active: p.id === projectRegistry.activeProjectId,
+      permissions: p.permissions,
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt
+    }))
+  };
+}
 
 function loadEnvFile(file) {
   if (!fs.existsSync(file)) return;
@@ -195,11 +343,24 @@ function disconnectTunnel() {
   return tunnelSummary();
 }
 
+function permissionForTool(name) {
+  if (['write_file','apply_patch'].includes(name)) return ['write','write files'];
+  if (name === 'delete_path') return ['delete','delete files'];
+  if (['run_command','verify_project'].includes(name)) return ['execute','run commands'];
+  if (['start_process','process_list','process_logs','stop_process'].includes(name)) return ['process','manage processes'];
+  if (['git_add','git_commit','git_restore'].includes(name)) return ['gitWrite','write Git state'];
+  if (name.startsWith('browser_')) return ['browser','use browser automation'];
+  if (['tree','read_file','read_range','search_text','repo_map','project_info','git_status','git_diff','git_log'].includes(name)) return ['read','read project data'];
+  return null;
+}
+
 function wrappedTool(name, fn) {
   return async (args = {}) => {
     const started = Date.now();
+    const permission = permissionForTool(name);
     toolCounters.set(name, (toolCounters.get(name) || 0) + 1);
     try {
+      if (permission) requireProjectPermission(permission[0], permission[1]);
       const data = await fn(args);
       await audit(name, args, 'success', { duration_ms: Date.now() - started });
       return { content: [{ type: 'text', text: asText(data) }] };
@@ -416,6 +577,8 @@ function processSnapshot() {
     pid: p.child.pid,
     command: p.command,
     cwd: p.cwd,
+    projectId: p.projectId || null,
+    projectName: projectRegistry.projects.find(project => project.id === p.projectId)?.name || null,
     status: p.status,
     exitCode: p.exitCode,
     logLines: p.logs.length
@@ -462,7 +625,8 @@ function securityDashboardSummary() {
   if (ALLOW_DANGEROUS) critical.push('Dangerous command mode đang được bật.');
   if (SHELL_MODE === 'workspace-trusted') warnings.push('Shell đang ở workspace-trusted; repository scripts có quyền của Windows account.');
   if (BROWSER_ALLOW_EXTERNAL) warnings.push('Browser được phép điều hướng ra host bên ngoài.');
-  warnings.push('Granular project permission engine chưa được triển khai.');
+  const permissions = activeProject().permissions;
+  if (permissions.execute && (!permissions.write || !permissions.gitWrite || !permissions.delete)) warnings.push('Execute là quyền mạnh: project scripts có thể thay đổi file/Git ngoài các tool-level permission riêng. Dùng VM/container nếu cần isolation nghiêm ngặt.');
   return {
     level: critical.length ? 'danger' : warnings.length ? 'warning' : 'ok',
     critical,
@@ -473,7 +637,8 @@ function securityDashboardSummary() {
       { label: 'Shell policy', value: SHELL_MODE, ok: SHELL_MODE === 'allowlist' },
       { label: 'Dangerous commands', value: ALLOW_DANGEROUS ? 'allowed' : 'blocked', ok: !ALLOW_DANGEROUS },
       { label: 'External browser', value: BROWSER_ALLOW_EXTERNAL ? 'allowed' : 'blocked', ok: !BROWSER_ALLOW_EXTERNAL },
-      { label: 'Audit logging', value: 'enabled', ok: true }
+      { label: 'Audit logging', value: 'enabled', ok: true },
+      { label: 'Project permissions', value: Object.entries(permissions).filter(([, enabled]) => enabled).map(([key]) => key).join(', '), ok: true }
     ]
   };
 }
@@ -522,6 +687,8 @@ async function dashboardPayload() {
     service: 'vibecode-mcp-secure',
     version: '0.1.0',
     workspace: WORKSPACE,
+    activeProject: activeProject(),
+    projects: projectRegistrySummary(),
     package: packageInfo,
     runtime: { node: process.version, platform: process.platform, host: HOST, port: PORT },
     shellMode: SHELL_MODE,
@@ -559,6 +726,19 @@ function registerTools(server) {
     processes: [...processRegistry.values()].map(p => ({ id: p.id, pid: p.child.pid, command: p.command, status: p.status })),
     toolsCalled: Object.fromEntries(toolCounters)
   })));
+
+  server.registerTool('project_list', {
+    description: 'List projects already approved in the local Control Center and show which one is active.',
+    inputSchema: z.object({})
+  }, wrappedTool('project_list', async () => projectRegistrySummary()));
+
+  server.registerTool('project_switch', {
+    description: 'Switch the active workspace to another project already approved in the local Control Center. Does not add new filesystem scope.',
+    inputSchema: z.object({ projectId: z.string().min(1) })
+  }, wrappedTool('project_switch', async ({ projectId }) => {
+    const project = await activateProjectRecord(projectId);
+    return { activeProject: projectRegistrySummary().projects.find(p => p.id === project.id), workspace: WORKSPACE };
+  }));
 
   server.registerTool('project_info', {
     description: 'Summarize the active workspace, package metadata, Git state, and top-level files.',
@@ -692,7 +872,7 @@ function registerTools(server) {
     const spec = shellSpec(command);
     const child = spawn(spec.file, spec.args, { cwd: resolvedCwd, env: process.env, windowsHide: true });
     const id = `proc_${randomUUID().slice(0, 8)}`;
-    const record = { id, child, command, cwd: resolvedCwd, status: 'running', exitCode: null, logs: [] };
+    const record = { id, child, projectId: activeProject().id, command, cwd: resolvedCwd, status: 'running', exitCode: null, logs: [] };
     const add = (stream, d) => { record.logs.push({ ts: new Date().toISOString(), stream, text: d.toString() }); if (record.logs.length > 500) record.logs.splice(0, record.logs.length - 500); };
     child.stdout?.on('data', d => add('stdout', d));
     child.stderr?.on('data', d => add('stderr', d));
@@ -703,8 +883,8 @@ function registerTools(server) {
   }));
 
   server.registerTool('process_list', {
-    description: 'List processes started by this MCP runtime.', inputSchema: z.object({})
-  }, wrappedTool('process_list', async () => [...processRegistry.values()].map(p => ({ id: p.id, pid: p.child.pid, command: p.command, cwd: p.cwd, status: p.status, exitCode: p.exitCode }))));
+    description: 'List processes started by this MCP runtime across approved projects.', inputSchema: z.object({})
+  }, wrappedTool('process_list', async () => [...processRegistry.values()].map(p => ({ id: p.id, pid: p.child.pid, projectId: p.projectId || null, projectName: projectRegistry.projects.find(project => project.id === p.projectId)?.name || null, command: p.command, cwd: p.cwd, status: p.status, exitCode: p.exitCode }))));
 
   server.registerTool('process_logs', {
     description: 'Read recent logs from a process started by this MCP runtime.',
@@ -811,11 +991,49 @@ app.get('/readyz', async (_req, res) => {
   const workspaceExists = fs.existsSync(WORKSPACE);
   res.status(workspaceExists ? 200 : 503).json({ ready: workspaceExists, workspace: WORKSPACE, reason: workspaceExists ? undefined : 'workspace_not_found' });
 });
+function requireLoopbackRequest(req) {
+  const address = String(req.socket?.remoteAddress || '');
+  if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address)) {
+    throw Object.assign(new Error('Project scope changes are only allowed from the local Control Center.'), { code: 'PERMISSION_DENIED' });
+  }
+}
+
+app.get('/api/projects', (_req, res) => res.json(projectRegistrySummary()));
+app.post('/api/projects', async (req, res) => {
+  try {
+    requireLoopbackRequest(req);
+    const project = await addApprovedProject({ name: req.body?.name, workspace: req.body?.workspace, permissions: req.body?.permissions });
+    res.status(201).json({ ok: true, project, projects: projectRegistrySummary() });
+  } catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
+});
+app.post('/api/projects/:id/activate', async (req, res) => {
+  try {
+    requireLoopbackRequest(req);
+    const project = await activateProjectRecord(req.params.id);
+    res.json({ ok: true, project, projects: projectRegistrySummary() });
+  } catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
+});
+app.patch('/api/projects/:id/permissions', async (req, res) => {
+  try {
+    requireLoopbackRequest(req);
+    const project = await updateProjectPermissions(req.params.id, req.body?.permissions || {});
+    res.json({ ok: true, project, projects: projectRegistrySummary() });
+  } catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
+});
+app.delete('/api/projects/:id', async (req, res) => {
+  try {
+    requireLoopbackRequest(req);
+    const removed = await removeApprovedProject(req.params.id);
+    res.json({ ok: true, removed, projects: projectRegistrySummary() });
+  } catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
+});
+
 app.get('/api/status', async (_req, res) => {
   try { res.json(await dashboardPayload()); }
   catch (error) { res.status(500).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get('/api/git/diff', async (_req, res) => {
+  requireProjectPermission('read', 'read Git diff');
   const result = await git(['diff']);
   res.status(result.exitCode === 0 ? 200 : 400).json(result);
 });
@@ -837,7 +1055,7 @@ app.post('/api/process/:id/stop', async (req, res) => {
   }
 });
 app.post('/api/verify', async (_req, res) => {
-  try { res.json({ ok: true, verification: await runVerification('.', 180000) }); }
+  try { requireProjectPermission('execute', 'run verification'); res.json({ ok: true, verification: await runVerification('.', 180000) }); }
   catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post('/api/tunnel/connect', (req, res) => {

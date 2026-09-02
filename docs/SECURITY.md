@@ -11,6 +11,8 @@
 - external browser URLs are blocked unless `VIBECODE_BROWSER_ALLOW_EXTERNAL=1`.
 - audit arguments recursively redact keys/tokens/secrets/passwords/authorization and omit source-content fields such as content/find/replace/replacement/body.
 - Runtime API key is not stored by the generated `.env` flow.
+- Project Add/Remove/permission changes are accepted only from the loopback Control Center.
+- MCP `project_switch` can only select an already-approved registry entry; it cannot register arbitrary filesystem paths.
 
 ## Regression protections
 
@@ -19,6 +21,12 @@ The self-test verifies that:
 - a blocked executable cannot be reached through Windows single-`&` command chaining;
 - a filesystem read cannot escape through a workspace junction/symlink;
 - file content written through MCP does not appear verbatim in audit output.
+
+## Project permissions
+
+Each approved project has tool-level switches for Read, Write, Execute, Process, Git Write, Browser, and Delete. These gates are enforced in the MCP tool wrapper and permission failures are audited.
+
+`Execute` is intentionally powerful. If enabled, repository scripts/interpreters still execute with the Windows account's OS permissions and may modify files or Git outside the narrower MCP write/delete/git tool gates. Treat reduced permissions as tool policy, not an OS sandbox. Use a VM/container/low-privilege account for strict isolation.
 
 ## Important limitation: shell is not an OS sandbox
 

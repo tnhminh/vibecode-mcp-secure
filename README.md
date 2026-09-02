@@ -17,7 +17,8 @@ This project intentionally keeps the architecture simple:
 - Official OpenAI `tunnel-client` installer/launcher
 - `runtimes connect` + `runtimes status`
 - `/healthz`, `/readyz`, local Operations Control Center
-- runtime Overview for workspace, Git, processes, verification, activity, security and Tunnel state
+- runtime Overview for projects/workspace, Git, processes, verification, activity, security and Tunnel state
+- Project Manager registry: approve multiple local workspaces, switch active project without MCP restart, and persist per-project tool permissions
 
 ### Layer 2 — Execution Runtime
 
@@ -51,6 +52,7 @@ LSP/AST semantic navigation is left as the next extension point rather than ship
 - external browser URLs blocked by default
 - NDJSON audit log with recursive secret/source-content redaction
 - Operations Control Center and enriched status endpoint
+- project registry with loopback-only Add/Remove/permission changes; MCP can only list/switch already-approved projects
 
 ### Layer 6 — Harness / Skills
 

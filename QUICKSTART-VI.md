@@ -136,11 +136,7 @@ Stop:
 STOP.cmd
 ```
 
-Nếu đổi project được phép thao tác:
-
-```text
-CONFIGURE.cmd
-```
+Để thêm/đổi project hằng ngày, mở Control Center → **Projects** → **+ Add Project**. Sau khi approve, có thể **Activate** project khác ngay mà không restart MCP. `CONFIGURE.cmd` chỉ còn cần khi đổi cấu hình bootstrap như workspace ban đầu/tunnel.
 
 ## 7) Tool chính đã có
 
@@ -149,11 +145,12 @@ CONFIGURE.cmd
 - Git: git_status, git_diff, git_log, git_add, git_commit, git_restore
 - Verification: verify_project
 - Browser: open/click/fill/snapshot/screenshot/close
+- Project Manager: project_list, project_switch
 - Observability: health, project_info, audit_tail
 
 ## 8) Giới hạn của bản bridge-ready
 
-Bản này phù hợp để vibecode trên máy cá nhân/repo tin cậy. Canonical symlink/junction workspace checks và audit content redaction đã có regression test. Nó vẫn chưa phải hardened multi-user/24x7 production service; còn thiếu granular project permission engine, local MCP auth v2, persistent process recovery, audit hash-chain và full security test suite.
+Bản này phù hợp để vibecode trên máy cá nhân/repo tin cậy. Project Manager có per-project **tool-level permissions**, canonical symlink/junction checks và audit content redaction đều có regression test. Nó vẫn chưa phải hardened multi-user/24x7 production service; `Execute` vẫn chạy code với quyền Windows account, và còn thiếu OS sandbox/local MCP auth v2, persistent process recovery, audit hash-chain và full security test suite.
 
 Để an toàn, giữ mặc định:
 
