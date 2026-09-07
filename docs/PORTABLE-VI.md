@@ -4,7 +4,7 @@
 
 1. Giải nén toàn bộ file ZIP vào một thư mục có quyền ghi, ví dụ `D:\Tools\VibecodeMCP`.
 2. Bấm đúp `RUN-Vibecode-MCP.cmd`.
-3. Cửa sổ CLI tự khởi động MCP local. Web Console ở `http://127.0.0.1:1167`.
+3. Cửa sổ CLI tự khởi động MCP local và watcher. Control Center ở `http://127.0.0.1:1167`.
 
 Node.js, tunnel client, dependencies và Chromium cho các công cụ `browser_*` đã nằm trong gói. Không cần chạy `npm install` hay cài Node.js.
 
@@ -14,7 +14,7 @@ Portable package cố ý không chứa runtime API key hoặc cấu hình tunnel
 
 ## Dừng dịch vụ
 
-Bấm **Stop** trong ứng dụng, hoặc chạy `STOP-Vibecode-MCP.cmd`.
+Chạy `STOP-Vibecode-MCP.cmd` (hoặc `VibecodeMCP.Cli.exe --stop`). Gói portable chỉ có CLI; không có ứng dụng desktop riêng.
 
 ## Lưu ý
 

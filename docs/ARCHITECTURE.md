@@ -28,7 +28,7 @@
 │ Layer 6: AGENTS + skill/harness scaffold    │
 └──────────────────────┬──────────────────────┘
                        ▼
-                 configured workspace
+          approved project selected by projectId
 ```
 
 ## Trust boundaries
@@ -41,9 +41,13 @@ No inbound Internet listener is required. `tunnel-client` initiates outbound HTT
 
 The MCP HTTP listener binds to `127.0.0.1`, not `0.0.0.0`.
 
-### Workspace boundary
+### Workspace and routing boundary
 
-Filesystem and Git paths are resolved relative to `VIBECODE_WORKSPACE` and rejected when they escape the root.
+Each approved project has a canonical workspace root. Every project-scoped MCP tool requires `projectId`, resolves only that registry entry, and rejects paths that escape its root. There is no fallback project selection.
+
+### Local operator boundary
+
+The Control Center is loopback-only. It can add/remove approved projects, manage permissions, browse/create a chosen local folder, and show the assigned frontend/backend/worker port plan. Port allocation excludes ports reserved by other approved projects and ports listening on the local machine; it is an allocation plan, not a deployment process by itself.
 
 ### Shell boundary
 
@@ -52,3 +56,7 @@ The command tool runs child processes under the Windows account that started MCP
 ## Why no background LLM
 
 The design avoids duplicating planning/coding/review models under the MCP. This keeps state simpler, avoids inference API cost, and makes the tool layer observable and deterministic.
+
+## Availability supervision
+
+`VibecodeMCP.Cli.exe` launches a watcher after MCP and tunnel readiness succeed. The watcher checks `/healthz` every 10 seconds. It restarts MCP only if health fails and the configured listener port is free. When another process owns the port, it logs the conflict rather than terminating or replacing that process. `--stop` stops the tunnel, MCP, and watcher together.

@@ -1,4 +1,4 @@
-# PROJECT_SPEC — Vibecode MCP Secure v0.1
+# PROJECT_SPEC — Vibecode MCP Secure v0.2
 
 ## Product goal
 
@@ -30,6 +30,10 @@ ChatGPT
 - health/readiness endpoints
 - local status UI
 - audit log
+- concurrent multi-project routing with an explicit `projectId` on every project-scoped tool call
+- loopback-only project picker and per-project permissions
+- deterministic per-project frontend/backend/worker port plans that avoid assigned and locally-listening ports
+- CLI health watcher that recovers a missing MCP listener without replacing an unknown process
 - Windows setup/config/start/stop/doctor scripts
 
 ### Deliberately deferred
@@ -37,7 +41,6 @@ ChatGPT
 - LSP multiplexing
 - tree-sitter/AST symbol graph
 - persistent semantic index
-- multi-workspace routing in one MCP process
 - background LLM workers
 - autonomous multi-agent orchestration
 - remote shell exposure outside Secure MCP Tunnel

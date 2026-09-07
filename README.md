@@ -18,7 +18,7 @@ This project intentionally keeps the architecture simple:
 - `runtimes connect` + `runtimes status`
 - `/healthz`, `/readyz`, local Operations Control Center
 - runtime Overview for projects/workspace, Git, processes, verification, activity, security and Tunnel state
-- Multi-Project Router registry: approve multiple local workspaces, keep them concurrently enabled, choose a `fallbackProjectId`, and persist per-project tool permissions
+- Multi-Project Router registry: approve multiple local workspaces, keep them concurrently enabled, assign deployment port plans, and persist per-project tool permissions
 
 ### Layer 2 — Execution Runtime
 
@@ -28,7 +28,7 @@ This project intentionally keeps the architecture simple:
 - `start_process`, `process_list`, `process_logs`, `stop_process`
 - Git tools
 - Playwright browser tools
-- all project-scoped tools accept optional `projectId`; omitted `projectId` routes to the fallback project
+- all project-scoped tools require an explicit `projectId`; the runtime never silently routes work to another project
 
 ### Layer 3 — Code Intelligence / Context
 
@@ -53,7 +53,9 @@ LSP/AST semantic navigation is left as the next extension point rather than ship
 - external browser URLs blocked by default
 - NDJSON audit log with recursive secret/source-content redaction
 - Operations Control Center and enriched status endpoint
-- project registry with loopback-only Add/Remove/permission changes; MCP can route only to already-approved projects and can change only the fallback, never widen filesystem scope
+- project registry with loopback-only Add/Remove/permission changes; MCP can route only to already-approved projects and cannot widen filesystem scope
+- project port allocation for frontend/backend/worker that excludes both ports assigned to other projects and ports currently listening on the machine
+- a CLI-managed watcher that checks `/healthz` and restarts MCP only when its port is unoccupied
 
 ### Layer 6 — Harness / Skills
 
@@ -184,6 +186,8 @@ The CLI launcher:
 6. runs official `tunnel-client runtimes connect` when required;
 7. verifies `runtimes status`;
 8. prints the local endpoint and exits after the MCP and tunnel are ready.
+
+It also starts a small local watcher. Every 10 seconds the watcher checks MCP health. If MCP is unavailable **and** port `1167` is free, it starts MCP again; if another process owns the port, it records the condition and leaves that process untouched. The watcher stops with `--stop`.
 
 Useful modes:
 
@@ -359,4 +363,4 @@ OpenAI official/public references used for this starter:
 
 The setup script intentionally downloads the **latest release at setup time** instead of pinning a stale tunnel binary inside this ZIP.
 
-- MCP tools cannot change FALLBACK or activate/switch projects. Routing mutations are local-only; agents route directly with projectId.
+- MCP tools cannot activate/switch projects. Routing mutations are local-only; agents always route directly with `projectId`.
