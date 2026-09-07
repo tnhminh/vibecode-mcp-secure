@@ -35,7 +35,12 @@ internal static class VibecodeLauncher
         public string RuntimeDir { get { return Path.Combine(Root, ".runtime"); } }
         public string CredentialPath { get { return Path.Combine(RuntimeDir, CredentialFileName); } }
         public string PidPath { get { return Path.Combine(RuntimeDir, "mcp.pid"); } }
+        public string WatchPidPath { get { return Path.Combine(RuntimeDir, "watcher.pid"); } }
+        public string WatchLogPath { get { return Path.Combine(RuntimeDir, "watcher.log"); } }
         public string TunnelExe { get { return Path.Combine(Root, "bin", "tunnel-client.exe"); } }
+        public string BundledNodeExe { get { return Path.Combine(Root, "runtime", "node", "node.exe"); } }
+        public string NodeExe { get { return File.Exists(BundledNodeExe) ? BundledNodeExe : FindOnPath("node.exe"); } }
+        public string PlaywrightBrowsersDir { get { return Path.Combine(Root, "runtime", "playwright-browsers"); } }
     }
 
     private sealed class RunResult
@@ -66,6 +71,8 @@ internal static class VibecodeLauncher
                 return Status(config);
             if (mode == "--stop")
                 return Stop(config);
+            if (mode == "--watch")
+                return Watch(config);
 
             return Start(config, noOpen);
         }
@@ -122,12 +129,21 @@ internal static class VibecodeLauncher
         PrintHeader();
         ValidateRuntime(c);
 
-        if (!HttpOk(c.HealthUrl, 1200))
+        bool healthOk = HttpOk(c.HealthUrl, 1200);
+        if (healthOk && !IsExpectedVibecodeMcp(c))
+            throw new Exception("Port " + c.Port + " is already serving a different Vibecode MCP checkout. This launcher will not attach to or replace it. Stop that checkout or configure a different local port.");
+
+        if (!healthOk)
         {
+            int listenerPid = FindListeningPid(c);
+            if (listenerPid > 0)
+                throw new Exception("Port " + c.Port + " is already occupied by PID " + listenerPid + ". This launcher will not replace an unverified listener. Stop it or configure a different local port.");
             WriteInfo("Starting local MCP server on " + c.Host + ":" + c.Port + " ...");
             StartMcp(c);
             if (!WaitHttp(c.HealthUrl, 40, 500))
                 throw new Exception("MCP health check failed. Run DOCTOR.cmd or inspect the server console.");
+            if (!IsExpectedVibecodeMcp(c))
+                throw new Exception("A process started on port " + c.Port + " but did not identify as this Vibecode MCP checkout.");
         }
         else
         {
@@ -156,6 +172,7 @@ internal static class VibecodeLauncher
         }
 
         WriteOk("Tunnel ready: alias '" + c.Alias + "'.");
+        EnsureWatcher(c);
         Console.WriteLine();
         Console.WriteLine("MCP:     " + c.McpUrl);
         Console.WriteLine("Control: " + c.ControlCenterUrl);
@@ -222,9 +239,11 @@ internal static class VibecodeLauncher
         Console.WriteLine("Root:      " + c.Root);
         Console.WriteLine("Workspace: " + c.Workspace);
         Console.WriteLine("MCP URL:   " + c.McpUrl);
-        Console.WriteLine("MCP:       " + (HttpOk(c.HealthUrl, 1200) ? "healthy" : "offline"));
-        Console.WriteLine("Ready:     " + (HttpOk(c.ReadyUrl, 1200) ? "yes" : "no"));
-        Console.WriteLine("Tunnel:    " + (TunnelReady(c) ? "ready" : "not ready"));
+        bool healthOk = HttpOk(c.HealthUrl, 1200);
+        bool expectedMcp = healthOk && IsExpectedVibecodeMcp(c);
+        Console.WriteLine("MCP:       " + (expectedMcp ? "healthy" : healthOk ? "different Vibecode checkout on this port" : "offline"));
+        Console.WriteLine("Ready:     " + (expectedMcp && HttpOk(c.ReadyUrl, 1200) ? "yes" : "no"));
+        Console.WriteLine("Tunnel:    " + (expectedMcp && TunnelReady(c) ? "ready" : "not checked"));
         Console.WriteLine("Alias:     " + c.Alias);
         Console.WriteLine("Tunnel ID: " + (ValidTunnelId(c.TunnelId) ? "configured" : "missing"));
         Console.WriteLine("DPAPI key: " + (File.Exists(c.CredentialPath) ? "stored" : "not stored"));
@@ -234,30 +253,79 @@ internal static class VibecodeLauncher
     private static int Stop(Config c)
     {
         PrintHeader();
+        if (HttpOk(c.HealthUrl, 1200) && !IsExpectedVibecodeMcp(c))
+        {
+            WriteWarn("Port " + c.Port + " belongs to a different Vibecode MCP checkout. Refusing to stop its MCP or tunnel.");
+            return 2;
+        }
         if (File.Exists(c.TunnelExe))
         {
             WriteInfo("Stopping tunnel alias '" + c.Alias + "'...");
             Run(c.TunnelExe, "runtimes stop " + Q(c.Alias), c.Root, null, 20000);
         }
 
-        if (File.Exists(c.PidPath))
+        int listenerPid = IsExpectedVibecodeMcp(c) ? FindListeningPid(c) : 0;
+        if (listenerPid > 0)
         {
-            string text = File.ReadAllText(c.PidPath).Trim();
-            int pid;
-            if (Int32.TryParse(text, out pid))
+            try
             {
-                try
-                {
-                    WriteInfo("Stopping MCP PID " + pid + "...");
-                    Run("taskkill.exe", "/PID " + pid + " /T /F", c.Root, null, 15000);
-                }
-                catch { }
+                WriteInfo("Stopping MCP listener PID " + listenerPid + "...");
+                Run("taskkill.exe", "/PID " + listenerPid + " /T /F", c.Root, null, 15000);
             }
-            try { File.Delete(c.PidPath); } catch { }
+            catch { }
+        }
+        else
+        {
+            WriteInfo("No verified Vibecode MCP listener found on port " + c.Port + ".");
         }
 
+        StopWatcher(c);
+        try { if (File.Exists(c.PidPath)) File.Delete(c.PidPath); } catch { }
         WriteOk("Stopped launcher-managed MCP/tunnel.");
         return 0;
+    }
+
+    private static int FindListeningPid(Config c)
+    {
+        try
+        {
+            RunResult net = Run("netstat.exe", "-ano -p tcp", c.Root, null, 10000);
+            if (net.ExitCode != 0) return 0;
+            string expected = c.Host + ":" + c.Port;
+            foreach (string raw in (net.StdOut ?? "").Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string line = raw.Trim();
+                if (!line.StartsWith("TCP", StringComparison.OrdinalIgnoreCase) || line.IndexOf("LISTENING", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                string[] parts = Regex.Split(line, @"\s+");
+                if (parts.Length < 5 || !String.Equals(parts[1], expected, StringComparison.OrdinalIgnoreCase)) continue;
+                int pid;
+                if (Int32.TryParse(parts[parts.Length - 1], out pid)) return pid;
+            }
+        }
+        catch { }
+        return 0;
+    }
+
+    private static bool IsExpectedVibecodeMcp(Config c)
+    {
+        try
+        {
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(c.HealthUrl);
+            req.Method = "GET";
+            req.Timeout = 1500;
+            req.ReadWriteTimeout = 1500;
+            req.Proxy = null;
+            using (HttpWebResponse res = (HttpWebResponse)req.GetResponse())
+            using (StreamReader reader = new StreamReader(res.GetResponseStream()))
+            {
+                string body = reader.ReadToEnd();
+                string expectedRoot = Path.GetFullPath(c.Root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string expectedRootJson = expectedRoot.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                return body.IndexOf("\"service\":\"vibecode-mcp-secure\"", StringComparison.OrdinalIgnoreCase) >= 0
+                    && body.IndexOf("\"serverRoot\":\"" + expectedRootJson + "\"", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+        }
+        catch { return false; }
     }
 
     private static int ResetKey(Config c)
@@ -274,7 +342,7 @@ internal static class VibecodeLauncher
         bool ok = true;
         ok &= Check("Project root", Directory.Exists(c.Root));
         ok &= Check("src/server.mjs", File.Exists(Path.Combine(c.Root, "src", "server.mjs")));
-        ok &= Check("Node.js", !String.IsNullOrWhiteSpace(FindOnPath("node.exe")));
+        ok &= Check("Node.js", !String.IsNullOrWhiteSpace(c.NodeExe));
         ok &= Check("tunnel-client.exe", File.Exists(c.TunnelExe));
         ok &= Check("Port", c.Port > 0 && c.Port < 65536);
 
@@ -300,8 +368,8 @@ internal static class VibecodeLauncher
     {
         if (!File.Exists(Path.Combine(c.Root, "src", "server.mjs")))
             throw new Exception("src/server.mjs not found next to launcher.");
-        if (String.IsNullOrWhiteSpace(FindOnPath("node.exe")))
-            throw new Exception("Node.js 20+ is required and was not found on PATH.");
+        if (String.IsNullOrWhiteSpace(c.NodeExe))
+            throw new Exception("Node.js 20+ was not found. The portable package needs runtime\\node\\node.exe; development installs may use Node.js on PATH.");
         if (!File.Exists(c.TunnelExe))
             throw new Exception("bin\\tunnel-client.exe not found. Run SETUP.cmd first.");
         if (!Directory.Exists(c.Workspace))
@@ -310,20 +378,90 @@ internal static class VibecodeLauncher
 
     private static void StartMcp(Config c)
     {
-        string node = FindOnPath("node.exe");
+        string node = c.NodeExe;
+        if (String.IsNullOrWhiteSpace(node)) throw new Exception("Node.js was not found.");
+
+        Environment.SetEnvironmentVariable("VIBECODE_WORKSPACE", c.Workspace);
+        Environment.SetEnvironmentVariable("VIBECODE_HOST", c.Host);
+        Environment.SetEnvironmentVariable("VIBECODE_PORT", c.Port.ToString());
+        Environment.SetEnvironmentVariable("VIBECODE_RUNTIME_DIR", c.RuntimeDir);
+        Environment.SetEnvironmentVariable("CONTROL_PLANE_TUNNEL_ID", c.TunnelId ?? "");
+        Environment.SetEnvironmentVariable("TUNNEL_ALIAS", c.Alias);
+        Environment.SetEnvironmentVariable("VIBECODE_SHELL_MODE", c.ShellMode);
+        Environment.SetEnvironmentVariable("VIBECODE_ALLOW_DANGEROUS", c.AllowDangerous);
+        Environment.SetEnvironmentVariable("VIBECODE_BROWSER_ALLOW_EXTERNAL", c.BrowserAllowExternal);
+        Environment.SetEnvironmentVariable("VIBECODE_MAX_READ_BYTES", c.MaxReadBytes);
+        Environment.SetEnvironmentVariable("VIBECODE_MAX_COMMAND_OUTPUT_BYTES", c.MaxCommandOutputBytes);
+        if (Directory.Exists(c.PlaywrightBrowsersDir))
+            Environment.SetEnvironmentVariable("PLAYWRIGHT_BROWSERS_PATH", c.PlaywrightBrowsersDir);
+
         ProcessStartInfo psi = new ProcessStartInfo();
         psi.FileName = node;
         psi.Arguments = "src/server.mjs";
         psi.WorkingDirectory = c.Root;
-        psi.UseShellExecute = false;
+        psi.UseShellExecute = true;
         psi.CreateNoWindow = true;
         psi.WindowStyle = ProcessWindowStyle.Hidden;
 
-        SetChildEnv(psi, c);
         Process p = Process.Start(psi);
-        if (p == null)
-            throw new Exception("Could not start node process.");
+        if (p == null) throw new Exception("Could not start node process.");
         File.WriteAllText(c.PidPath, p.Id.ToString(), Encoding.ASCII);
+    }
+
+    private static int Watch(Config c)
+    {
+        File.WriteAllText(c.WatchPidPath, Process.GetCurrentProcess().Id.ToString(), Encoding.ASCII);
+        WriteWatch(c, "watcher started");
+        try
+        {
+            while (true)
+            {
+                if (!HttpOk(c.HealthUrl, 1500))
+                {
+                    int listenerPid = FindListeningPid(c);
+                    if (listenerPid > 0) WriteWatch(c, "health failed but port is occupied by PID " + listenerPid + "; not replacing it");
+                    else
+                    {
+                        try
+                        {
+                            if (File.Exists(c.PidPath)) File.Delete(c.PidPath);
+                            StartMcp(c);
+                            WriteWatch(c, WaitHttp(c.HealthUrl, 20, 500) ? "MCP restarted" : "MCP restart did not become healthy");
+                        }
+                        catch (Exception ex) { WriteWatch(c, "MCP restart failed: " + ex.Message); }
+                    }
+                }
+                Thread.Sleep(10000);
+            }
+        }
+        finally { try { if (File.Exists(c.WatchPidPath)) File.Delete(c.WatchPidPath); } catch { } }
+    }
+
+    private static void EnsureWatcher(Config c)
+    {
+        int existing;
+        if (File.Exists(c.WatchPidPath) && Int32.TryParse(File.ReadAllText(c.WatchPidPath).Trim(), out existing))
+        {
+            try { Process.GetProcessById(existing); return; } catch { try { File.Delete(c.WatchPidPath); } catch { } }
+        }
+        var psi = new ProcessStartInfo { FileName = Process.GetCurrentProcess().MainModule.FileName, Arguments = "--watch", WorkingDirectory = c.Root, UseShellExecute = false, CreateNoWindow = true };
+        Process.Start(psi);
+    }
+
+    private static void StopWatcher(Config c)
+    {
+        try
+        {
+            int pid;
+            if (File.Exists(c.WatchPidPath) && Int32.TryParse(File.ReadAllText(c.WatchPidPath).Trim(), out pid)) Run("taskkill.exe", "/PID " + pid + " /T /F", c.Root, null, 15000);
+        }
+        catch { }
+        try { if (File.Exists(c.WatchPidPath)) File.Delete(c.WatchPidPath); } catch { }
+    }
+
+    private static void WriteWatch(Config c, string message)
+    {
+        try { File.AppendAllText(c.WatchLogPath, DateTime.Now.ToString("o") + " " + message + Environment.NewLine, Encoding.UTF8); } catch { }
     }
 
     private static void SetChildEnv(ProcessStartInfo psi, Config c)

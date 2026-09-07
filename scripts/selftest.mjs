@@ -53,7 +53,8 @@ try {
 
   const controlCenter = await fetch(`http://127.0.0.1:${selftestPort}/`);
   const controlCenterHtml = await controlCenter.text();
-  if (!controlCenter.ok || !controlCenterHtml.includes('Operations Console') || !controlCenterHtml.includes('Git & Verification') || !controlCenterHtml.includes('+ Add Project') || !controlCenterHtml.includes('Set Default')) throw new Error('Control Center did not render Operations Console + Multi-Project Router UI.');
+  if (!controlCenter.ok || !controlCenterHtml.includes('Operations Console') || !controlCenterHtml.includes('Git & Verification') || !controlCenterHtml.includes('+ Add Project') || !controlCenterHtml.includes('Browse folders / drives') || !controlCenterHtml.includes('projectId</code>')) throw new Error('Control Center did not render explicit-project routing + folder picker UI.');
+  if (controlCenterHtml.includes('preventFallback(')) throw new Error('Control Center regression: submit handlers must call event.preventDefault().');
 
   const invalidTunnel = await fetch(`http://127.0.0.1:${selftestPort}/api/tunnel/connect`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -66,30 +67,44 @@ try {
   await client.connect(transport);
   const { tools } = await client.listTools();
   const names = new Set(tools.map(t => t.name));
-  for (const required of ['health', 'project_list', 'project_set_default', 'project_switch', 'repo_map', 'apply_patch', 'run_command', 'git_diff', 'verify_project', 'browser_open', 'audit_tail']) {
+  for (const required of ['health', 'project_list', 'repo_map', 'apply_patch', 'run_command', 'git_diff', 'verify_project', 'browser_open', 'audit_tail']) {
     if (!names.has(required)) throw new Error(`Required MCP tool missing: ${required}`);
   }
+  const healthPayload = await fetch(`http://127.0.0.1:${selftestPort}/healthz`).then(r => r.json());
+  if (healthPayload.serverRoot !== root) throw new Error(`Server identity mismatch: expected ${root}, got ${healthPayload.serverRoot || 'missing'}.`);
   const health = await client.callTool({ name: 'health', arguments: {} });
   if (health.isError) throw new Error(`health tool returned error: ${JSON.stringify(health.content)}`);
+  const projectsBefore = await fetch(`http://127.0.0.1:${selftestPort}/api/projects`).then(r => r.json());
+  const rootProject = projectsBefore.projects[0];
+  if (!rootProject) throw new Error('Multi-Project Router regression: no initial approved project.');
 
-  const directDenied = await client.callTool({ name: 'run_command', arguments: { command: 'whoami' } });
+  const directDenied = await client.callTool({ name: 'run_command', arguments: { projectId: rootProject.id, command: 'whoami' } });
   if (!directDenied.isError) throw new Error('Shell allowlist regression: direct blocked executable was allowed.');
-  const chainedDenied = await client.callTool({ name: 'run_command', arguments: { command: 'node --version & whoami' } });
+  const chainedDenied = await client.callTool({ name: 'run_command', arguments: { projectId: rootProject.id, command: 'node --version & whoami' } });
   if (!chainedDenied.isError) throw new Error('Shell allowlist regression: single-& command chaining bypass was allowed.');
 
-  const junctionDenied = await client.callTool({ name: 'read_file', arguments: { path: '.vibecode-artifacts/selftest-outside-junction/outside.txt' } });
+  const junctionDenied = await client.callTool({ name: 'read_file', arguments: { projectId: rootProject.id, path: '.vibecode-artifacts/selftest-outside-junction/outside.txt' } });
   if (!junctionDenied.isError) throw new Error('Workspace regression: junction escape was allowed.');
 
   const auditProbe = 'selftest-sensitive-content-' + Date.now();
-  const writeProbe = await client.callTool({ name: 'write_file', arguments: { path: '.vibecode-artifacts/selftest-audit.txt', content: auditProbe } });
+  const writeProbe = await client.callTool({ name: 'write_file', arguments: { projectId: rootProject.id, path: '.vibecode-artifacts/selftest-audit.txt', content: auditProbe } });
   if (writeProbe.isError) throw new Error('Audit redaction probe write failed.');
   const auditTail = await client.callTool({ name: 'audit_tail', arguments: { limit: 20 } });
   if (JSON.stringify(auditTail).includes(auditProbe)) throw new Error('Audit regression: file content leaked into audit output.');
-  await client.callTool({ name: 'delete_path', arguments: { path: '.vibecode-artifacts/selftest-audit.txt', confirm: true } });
+  await client.callTool({ name: 'delete_path', arguments: { projectId: rootProject.id, path: '.vibecode-artifacts/selftest-audit.txt', confirm: true } });
 
-  const projectsBefore = await fetch(`http://127.0.0.1:${selftestPort}/api/projects`).then(r => r.json());
-  const rootProject = projectsBefore.projects.find(p => p.default);
-  if (!rootProject) throw new Error('Multi-Project Router regression: no default initial project.');
+
+  const foldersBefore = await fetch(`http://127.0.0.1:${selftestPort}/api/folders?path=${encodeURIComponent(projectTemp)}`).then(r => r.json());
+  if (!foldersBefore.ok || foldersBefore.currentPath !== projectTemp || !Array.isArray(foldersBefore.roots)) throw new Error('Folder picker regression: selected folder could not be listed.');
+  const createdFolder = await fetch(`http://127.0.0.1:${selftestPort}/api/folders`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ parentPath: projectTemp, name: 'created-from-picker' })
+  });
+  const createdFolderJson = await createdFolder.json();
+  if (!createdFolder.ok || !fs.existsSync(createdFolderJson.createdPath)) throw new Error(`Folder picker regression: create failed: ${JSON.stringify(createdFolderJson)}`);
+  const invalidFolder = await fetch(`http://127.0.0.1:${selftestPort}/api/folders`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ parentPath: projectTemp, name: '../escape' })
+  });
+  if (invalidFolder.status !== 400) throw new Error('Folder picker regression: path traversal folder name was accepted.');
 
   const addProjectResponse = await fetch(`http://127.0.0.1:${selftestPort}/api/projects`, {
     method: 'POST',
@@ -102,6 +117,7 @@ try {
   });
   const addProjectJson = await addProjectResponse.json();
   if (!addProjectResponse.ok || !addProjectJson.project?.id) throw new Error(`Multi-Project Router regression: add failed: ${JSON.stringify(addProjectJson)}`);
+  if (!addProjectJson.project?.ports?.frontend || !addProjectJson.project?.ports?.backend || !addProjectJson.project?.ports?.worker) throw new Error('Deployment port allocation regression: project ports missing.');
   const testProjectId = addProjectJson.project.id;
 
   const listAfterAdd = await client.callTool({ name: 'project_list', arguments: {} });
@@ -110,8 +126,8 @@ try {
   const markerRead = await client.callTool({ name: 'read_file', arguments: { projectId: testProjectId, path: 'marker.txt' } });
   if (markerRead.isError || !JSON.stringify(markerRead).includes('project-router-ok')) throw new Error('Multi-Project Router regression: explicit projectId did not route to secondary project.');
 
-  const defaultStillRoot = await client.callTool({ name: 'project_info', arguments: {} });
-  if (defaultStillRoot.isError || !JSON.stringify(defaultStillRoot).includes(path.basename(root))) throw new Error('Multi-Project Router regression: explicit secondary call unexpectedly changed default project.');
+  const missingProject = await client.callTool({ name: 'project_info', arguments: {} });
+  if (!missingProject.isError || !JSON.stringify(missingProject).includes('projectId')) throw new Error('Project routing regression: missing projectId must be rejected.');
 
   const writeDenied = await client.callTool({ name: 'write_file', arguments: { projectId: testProjectId, path: 'blocked.txt', content: 'must-not-write' } });
   if (!writeDenied.isError) throw new Error('Project permission regression: write=false was not enforced on targeted project.');
@@ -125,16 +141,12 @@ try {
   const writeAllowed = await client.callTool({ name: 'write_file', arguments: { projectId: testProjectId, path: 'allowed.txt', content: 'permission-ok' } });
   if (writeAllowed.isError) throw new Error('Project permission regression: write=true was not applied to targeted project.');
 
-  const setDefault = await client.callTool({ name: 'project_set_default', arguments: { projectId: testProjectId } });
-  if (setDefault.isError) throw new Error('Multi-Project Router regression: project_set_default failed.');
-  const defaultMarker = await client.callTool({ name: 'read_file', arguments: { path: 'marker.txt' } });
-  if (defaultMarker.isError || !JSON.stringify(defaultMarker).includes('project-router-ok')) throw new Error('Multi-Project Router regression: default fallback did not update.');
+  if (tools.some(tool => ['project_set_default', 'project_switch'].includes(tool.name))) {
+    throw new Error('Multi-Project Router regression: MCP must not expose global routing mutation tools.');
+  }
 
   const explicitRoot = await client.callTool({ name: 'project_info', arguments: { projectId: rootProject.id } });
-  if (explicitRoot.isError || !JSON.stringify(explicitRoot).includes(path.basename(root))) throw new Error('Multi-Project Router regression: explicit root routing failed after default changed.');
-
-  const setDefaultBack = await client.callTool({ name: 'project_switch', arguments: { projectId: rootProject.id } });
-  if (setDefaultBack.isError) throw new Error('Multi-Project Router regression: backward-compatible project_switch alias failed.');
+  if (explicitRoot.isError || !JSON.stringify(explicitRoot).includes(path.basename(root))) throw new Error('Multi-Project Router regression: explicit root routing failed.');
   const removeResponse = await fetch(`http://127.0.0.1:${selftestPort}/api/projects/${encodeURIComponent(testProjectId)}`, { method: 'DELETE' });
   if (!removeResponse.ok) throw new Error('Multi-Project Router regression: remove failed.');
 

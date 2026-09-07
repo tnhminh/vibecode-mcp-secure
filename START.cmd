@@ -1,8 +1,8 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-if exist ".\VibecodeMCP.exe" (
-  ".\VibecodeMCP.exe"
+if exist ".\VibecodeMCP.Cli.exe" (
+  ".\VibecodeMCP.Cli.exe" --no-open
   set "RC=%ERRORLEVEL%"
   if not "%RC%"=="0" pause
   exit /b %RC%

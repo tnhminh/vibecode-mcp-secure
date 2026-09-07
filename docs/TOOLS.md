@@ -2,7 +2,7 @@
 
 ## Project routing
 
-All project-scoped tools accept optional `projectId`. If omitted, the runtime routes the call to `defaultProjectId`. Filesystem boundary, permissions, Git cwd, process ownership, browser state, screenshot artifacts, verification state, and audit context are resolved per project.
+All project-scoped tools accept optional `projectId`. If omitted, the runtime routes the call to `fallbackProjectId`. Filesystem boundary, permissions, Git cwd, process ownership, browser state, screenshot artifacts, verification state, and audit context are resolved per project.
 
 ## Context and filesystem
 
@@ -10,16 +10,16 @@ All project-scoped tools accept optional `projectId`. If omitted, the runtime ro
 Runtime configuration and process/tool counters.
 
 ### project_list
-Lists all projects already approved from the local Control Center and shows the `defaultProjectId`. All approved projects remain concurrently enabled.
+Lists all projects already approved from the local Control Center and shows the `fallbackProjectId`. All approved projects remain concurrently enabled.
 
-### project_set_default
+### local Set Fallback
 Sets the fallback project used when a project-scoped tool omits `projectId`. It does not disable or switch off other approved projects.
 
-### project_switch
-Backward-compatible alias for `project_set_default`. It no longer represents an exclusive active-project switch.
+### removed switch
+Backward-compatible alias for `local Set Fallback`. It no longer represents an exclusive active-project switch.
 
 ### project_info
-Workspace/package/Git summary for one approved project. Pass `projectId`; omit it to use the default project.
+Workspace/package/Git summary for one approved project. Pass `projectId`; omit it to use the fallback project.
 
 ### tree
 Compact directory tree with depth and entry limits.

@@ -17,6 +17,12 @@ Inspect:
 
 Confirm the configured workspace exists.
 
+## Another Vibecode checkout is using the configured port
+
+Each Vibecode checkout identifies its own source root through the local health endpoint. The launcher refuses to reuse or stop a different checkout on the same port, preventing a Control Center from silently managing the wrong server.
+
+Stop the other checkout first, or configure this checkout with a different local port and a matching tunnel runtime.
+
 ## Browser tools complain that Chromium is missing
 
 From the project folder:

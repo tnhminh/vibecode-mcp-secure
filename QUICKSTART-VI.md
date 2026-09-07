@@ -32,7 +32,7 @@ Sau đó double-click:
 FIRST-RUN.cmd
 ```
 
-Script sẽ chạy Setup → cấu hình launcher → start. Sau lần đầu, chỉ cần double-click `VibecodeMCP.exe`.
+Script sẽ chạy Setup → cấu hình launcher → start. Sau lần đầu, chỉ cần double-click `START.cmd`.
 
 ### Khi Configure hỏi workspace
 
@@ -60,17 +60,17 @@ Dùng Restricted Runtime API key có quyền:
 Tunnels Read + Use
 ```
 
-Key không được ghi vào `.env`. Với launcher EXE, key có thể được nhập một lần rồi lưu mã hóa bằng Windows DPAPI trong `.runtime`, chỉ tài khoản Windows hiện tại giải mã được.
+Key không được ghi vào `.env`. Với launcher CLI, key có thể được nhập một lần rồi lưu mã hóa bằng Windows DPAPI trong `.runtime`, chỉ tài khoản Windows hiện tại giải mã được.
 
-### Launcher EXE
+### Launcher CLI
 
-Sau khi SETUP xong, chạy trực tiếp app Windows native:
+Sau khi SETUP xong, chạy:
 
 ```text
-VibecodeMCP.exe
+START.cmd
 ```
 
-App có giao diện Overview / Projects / Logs / Settings và **không tự mở browser**. Localhost chỉ chạy ngầm làm backend; chỉ nút **Open Web Console** mới mở trình duyệt.
+CLI sẽ start MCP và tunnel. Mở Control Center bằng trình duyệt tại `http://127.0.0.1:1167/` khi cần quản lý project hoặc xem trạng thái.
 
 Các lệnh tiện dụng: `--status`, `--stop`, `--configure`, `--reset-key`, `--self-test`, `--no-open`.
 
@@ -133,10 +133,10 @@ review git diff và báo kết quả. Không commit nếu tôi chưa yêu cầu.
 Start (khuyến nghị):
 
 ```text
-VibecodeMCP.exe
+START.cmd
 ```
 
-`START.cmd` cũng tự gọi EXE nếu file tồn tại.
+`START.cmd` tự gọi CLI nếu file tồn tại.
 
 Diagnose:
 
@@ -150,7 +150,7 @@ Stop:
 STOP.cmd
 ```
 
-Để thêm project hằng ngày, mở Control Center → **Projects** → **+ Add Project**. Tất cả project đã approve đều **ENABLED đồng thời**. Nút **Set Default** chỉ chọn project fallback khi tool call không truyền `projectId`; các project khác vẫn được gọi trực tiếp bằng `projectId` mà không cần switch/restart MCP. `CONFIGURE.cmd` chỉ còn cần khi đổi cấu hình bootstrap như workspace ban đầu/tunnel.
+Để thêm project hằng ngày, mở Control Center → **Projects** → **+ Add Project**. Tất cả project đã approve đều **ENABLED đồng thời**. Nút **Set Fallback** chỉ chọn project fallback khi tool call không truyền `projectId`; các project khác vẫn được gọi trực tiếp bằng `projectId` mà không cần switch/restart MCP. `CONFIGURE.cmd` chỉ còn cần khi đổi cấu hình bootstrap như workspace ban đầu/tunnel.
 
 ## 7) Tool chính đã có
 
@@ -159,7 +159,7 @@ STOP.cmd
 - Git: git_status, git_diff, git_log, git_add, git_commit, git_restore
 - Verification: verify_project
 - Browser: open/click/fill/snapshot/screenshot/close
-- Multi-Project Router: project_list, project_set_default, project_switch (alias tương thích cũ); mọi tool project-scoped nhận `projectId?`
+- Multi-Project Router: project_list; mọi tool project-scoped nhận `projectId?`
 - Observability: health, project_info, audit_tail
 
 ## 8) Giới hạn của bản bridge-ready
@@ -174,3 +174,5 @@ VIBECODE_SHELL_MODE=allowlist
 VIBECODE_ALLOW_DANGEROUS=0
 VIBECODE_BROWSER_ALLOW_EXTERNAL=0
 ```
+
+> Router v3: MCP không có tool đổi FALLBACK/ACTIVE. Mọi project đã approve luôn ENABLED đồng thời; agent route trực tiếp bằng projectId. Chỉ local Control Center được đổi FALLBACK.

@@ -10,9 +10,9 @@
 - high-risk command patterns are denied unless `VIBECODE_ALLOW_DANGEROUS=1`.
 - external browser URLs are blocked unless `VIBECODE_BROWSER_ALLOW_EXTERNAL=1`.
 - audit arguments recursively redact keys/tokens/secrets/passwords/authorization and omit source-content fields such as content/find/replace/replacement/body.
-- Runtime API key is never stored in `.env`. `VibecodeMCP.exe` may store it encrypted with Windows DPAPI under `.runtime`, scoped to the current Windows user; use `VibecodeMCP.exe --reset-key` to remove it.
+- Runtime API key is never stored in `.env`. `VibecodeMCP.Cli.exe` stores it encrypted with Windows DPAPI under `.runtime`, scoped to the current Windows user; use `VibecodeMCP.Cli.exe --reset-key` to remove it.
 - Project Add/Remove/permission changes are accepted only from the loopback Control Center.
-- MCP project routing can only target already-approved registry entries; `project_set_default` / legacy `project_switch` only change the default fallback and cannot register arbitrary filesystem paths.
+- MCP project routing can only target already-approved registry entries; `local Set Fallback` / legacy `removed switch` only change the fallback and cannot register arbitrary filesystem paths.
 
 ## Regression protections
 
@@ -24,7 +24,7 @@ The self-test verifies that:
 
 ## Project permissions
 
-Each approved project has tool-level switches for Read, Write, Execute, Process, Git Write, Browser, and Delete. All approved projects remain concurrently enabled; every project-scoped tool resolves its own `projectId` (or the default fallback), then enforces that project's gate. Permission failures and resolved project context are audited.
+Each approved project has tool-level switches for Read, Write, Execute, Process, Git Write, Browser, and Delete. All approved projects remain concurrently enabled; every project-scoped tool resolves its own `projectId` (or the fallback), then enforces that project's gate. Permission failures and resolved project context are audited.
 
 `Execute` is intentionally powerful. If enabled, repository scripts/interpreters still execute with the Windows account's OS permissions and may modify files or Git outside the narrower MCP write/delete/git tool gates. Treat reduced permissions as tool policy, not an OS sandbox. Use a VM/container/low-privilege account for strict isolation.
 

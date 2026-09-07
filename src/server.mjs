@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -33,7 +34,8 @@ const SAFE_NEW_PROJECT_PERMISSIONS = Object.freeze({ read: true, write: true, ex
 
 await fsp.mkdir(RUNTIME_DIR, { recursive: true });
 let projectRegistry = loadProjectRegistry();
-await ensureProjectArtifacts(projectRegistry.defaultProjectId);
+await reconcileProjectPorts();
+for (const project of projectRegistry.projects) await ensureProjectArtifacts(project.id);
 
 const ignoredDirs = new Set(['.git', 'node_modules', '.next', 'dist', 'build', 'coverage', '.turbo', '.cache', '.venv', 'venv']);
 const processRegistry = new Map();
@@ -58,7 +60,19 @@ function normalizePermissions(input = {}) {
   return out;
 }
 
-function makeProjectRecord({ id = randomUUID(), name, workspace, permissions = {} }) {
+function normalizeProjectPorts(input = {}, index = 0) {
+  const fallback = { frontend: 3000 + index, backend: 4000 + index, worker: 5000 + index };
+  const ports = {};
+  for (const key of Object.keys(fallback)) {
+    const value = Number(input?.[key] ?? fallback[key]);
+    if (!Number.isInteger(value) || value < 1024 || value > 65535) throw new Error(`Invalid ${key} port.`);
+    ports[key] = value;
+  }
+  if (new Set(Object.values(ports)).size !== Object.keys(ports).length) throw new Error('Project service ports must be unique.');
+  return ports;
+}
+
+function makeProjectRecord({ id = randomUUID(), name, workspace, permissions = {}, ports = {}, portIndex = 0 }) {
   const resolved = path.resolve(workspace);
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
     throw new Error(`Project workspace does not exist or is not a directory: ${workspace}`);
@@ -69,6 +83,7 @@ function makeProjectRecord({ id = randomUUID(), name, workspace, permissions = {
     name: String(name || path.basename(resolved)).trim() || path.basename(resolved),
     workspace: resolved,
     canonicalWorkspace: canonical,
+    ports: normalizeProjectPorts(ports, portIndex),
     permissions: normalizePermissions(permissions),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
@@ -81,13 +96,13 @@ function loadProjectRegistry() {
     try { parsed = JSON.parse(fs.readFileSync(PROJECTS_FILE, 'utf8')); } catch {}
   }
   const initial = makeProjectRecord({ name: path.basename(INITIAL_WORKSPACE), workspace: INITIAL_WORKSPACE });
-  const projects = Array.isArray(parsed?.projects) ? parsed.projects.map(p => {
+  const projects = Array.isArray(parsed?.projects) ? parsed.projects.map((p, index) => {
     try {
       const record = makeProjectRecord({
         id: p.id,
         name: p.name,
         workspace: p.workspace,
-        permissions: p.permissions
+        permissions: p.permissions, ports: p.ports, portIndex: index
       });
       record.createdAt = p.createdAt || record.createdAt;
       record.updatedAt = p.updatedAt || record.updatedAt;
@@ -97,17 +112,12 @@ function loadProjectRegistry() {
     }
   }).filter(Boolean) : [];
   if (!projects.some(p => p.canonicalWorkspace === initial.canonicalWorkspace)) projects.unshift(initial);
-  const requestedDefaultId = parsed?.defaultProjectId || parsed?.activeProjectId;
-  const defaultProjectId = projects.some(p => p.id === requestedDefaultId)
-    ? requestedDefaultId
-    : (projects.find(p => p.canonicalWorkspace === initial.canonicalWorkspace)?.id || projects[0].id);
-  return { version: 2, defaultProjectId, projects };
+  return { version: 4, projects };
 }
 
 async function saveProjectRegistry() {
   const payload = {
-    version: 2,
-    defaultProjectId: projectRegistry.defaultProjectId,
+    version: 4,
     projects: projectRegistry.projects.map(({ canonicalWorkspace, ...project }) => project)
   };
   const temp = PROJECTS_FILE + '.tmp';
@@ -121,12 +131,9 @@ function projectById(id) {
   return project;
 }
 
-function defaultProject() {
-  return projectById(projectRegistry.defaultProjectId);
-}
-
 function projectContext(projectId) {
-  const project = projectById(projectId || projectRegistry.defaultProjectId);
+  if (!projectId) throw Object.assign(new Error('projectId is required. Call project_list and explicitly choose an approved project.'), { code: 'PROJECT_REQUIRED' });
+  const project = projectById(projectId);
   const workspace = path.resolve(project.workspace);
   if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
     throw Object.assign(new Error(`Project workspace unavailable: ${workspace}`), { code: 'PROJECT_UNAVAILABLE' });
@@ -147,15 +154,14 @@ async function ensureProjectArtifacts(projectId) {
   return context;
 }
 
-async function setDefaultProject(id) {
-  const context = await ensureProjectArtifacts(id);
-  projectRegistry.defaultProjectId = context.project.id;
-  await saveProjectRegistry();
-  return context.project;
-}
-
 async function addApprovedProject({ name, workspace, permissions }) {
-  const record = makeProjectRecord({ name, workspace, permissions: permissions ?? SAFE_NEW_PROJECT_PERMISSIONS });
+  const portIndex = projectRegistry.projects.length;
+  const record = makeProjectRecord({ name, workspace, permissions: permissions ?? SAFE_NEW_PROJECT_PERMISSIONS, portIndex });
+  const reserved = new Set(projectRegistry.projects.flatMap(project => Object.values(project.ports || {})));
+  for (const [service, port] of Object.entries(record.ports)) {
+    record.ports[service] = await nextAvailableProjectPort(port, reserved);
+    reserved.add(record.ports[service]);
+  }
   if (projectRegistry.projects.some(p => p.canonicalWorkspace === record.canonicalWorkspace)) {
     throw new Error('Project workspace is already registered.');
   }
@@ -165,11 +171,44 @@ async function addApprovedProject({ name, workspace, permissions }) {
   return record;
 }
 
+function canBindPort(port, host) {
+  return new Promise(resolve => {
+    const probe = net.createServer();
+    probe.once('error', error => resolve(error?.code === 'EADDRNOTAVAIL'));
+    probe.listen({ port, host, exclusive: true }, () => probe.close(() => resolve(true)));
+  });
+}
+
+async function isPortAvailable(port) {
+  return await canBindPort(port, '127.0.0.1') && await canBindPort(port, '::');
+}
+
+async function nextAvailableProjectPort(start, reserved) {
+  for (let candidate = start; candidate <= 65535; candidate++) {
+    if (!reserved.has(candidate) && await isPortAvailable(candidate)) return candidate;
+  }
+  throw new Error('No available host port remains for this project service.');
+}
+
+async function reconcileProjectPorts() {
+  const reserved = new Set();
+  let changed = false;
+  for (const [index, project] of projectRegistry.projects.entries()) {
+    const requested = normalizeProjectPorts(project.ports, index);
+    for (const [service, port] of Object.entries(requested)) {
+      const assigned = await nextAvailableProjectPort(port, reserved);
+      if (project.ports?.[service] !== assigned) changed = true;
+      project.ports = { ...(project.ports || {}), [service]: assigned };
+      reserved.add(assigned);
+    }
+  }
+  if (changed) await saveProjectRegistry();
+}
+
 async function removeApprovedProject(id) {
   if (projectRegistry.projects.length <= 1) throw new Error('At least one project must remain registered.');
   const index = projectRegistry.projects.findIndex(p => p.id === id);
   if (index < 0) throw new Error(`Unknown project id: ${id}`);
-  if (projectRegistry.defaultProjectId === id) throw new Error('Cannot remove the default project. Set another default project first.');
   if ([...processRegistry.values()].some(p => p.projectId === id && p.status === 'running')) throw new Error('Cannot remove a project while it has running MCP-managed processes.');
   const browserState = browserStates.get(id);
   if (browserState) {
@@ -199,14 +238,12 @@ function requireProjectPermission(project, permission, action = permission) {
 
 function projectRegistrySummary() {
   return {
-    defaultProjectId: projectRegistry.defaultProjectId,
     projects: projectRegistry.projects.map(p => ({
       id: p.id,
       name: p.name,
       workspace: p.workspace,
+      ports: p.ports,
       enabled: true,
-      default: p.id === projectRegistry.defaultProjectId,
-      active: p.id === projectRegistry.defaultProjectId,
       permissions: p.permissions,
       createdAt: p.createdAt,
       updatedAt: p.updatedAt
@@ -283,9 +320,67 @@ function tunnelSummary() {
     alias: tunnelRuntime.alias || TUNNEL_ALIAS,
     clientInstalled: fs.existsSync(TUNNEL_CLIENT),
     runtimeStatus: tunnelRuntime.status,
+    ready: tunnelRuntime.status === 'connected',
+    healthy: tunnelRuntime.status === 'connected',
+    processRunning: Boolean(tunnelRuntime.child && !tunnelRuntime.child.killed),
     lastMessage: tunnelRuntime.lastMessage,
     startedAt: tunnelRuntime.startedAt
   };
+}
+
+let tunnelProbeCache = { at: 0, value: null };
+
+async function liveTunnelSummary({ maxAgeMs = 2500 } = {}) {
+  const base = tunnelSummary();
+  if (!fs.existsSync(TUNNEL_CLIENT)) return base;
+  if (tunnelProbeCache.value && Date.now() - tunnelProbeCache.at < maxAgeMs) return tunnelProbeCache.value;
+
+  const alias = base.alias || TUNNEL_ALIAS;
+  try {
+    const probe = await runSpawn(TUNNEL_CLIENT, ['runtimes', 'status', alias, '--json'], PROJECT_ROOT, 15000);
+    if (probe.exitCode !== 0) throw new Error((probe.stderr || probe.stdout || 'tunnel status failed').trim());
+
+    const parsed = JSON.parse(probe.stdout || '{}');
+    const expectedTarget = `http://${HOST}:${PORT}/mcp`;
+    const target = parsed?.process?.target_value || parsed?.target_value || '';
+    const targetMatches = !target || target === expectedTarget;
+    const ready = Boolean(parsed?.ready || parsed?.runtime_state === 'ready' || parsed?.local?.runtime_state === 'ready') && targetMatches;
+    const processRunning = Boolean(parsed?.process_running || parsed?.local?.process_running);
+    const healthy = Boolean(parsed?.healthy ?? parsed?.local?.effective_health?.healthz?.ok ?? ready);
+    const runtimeStatus = ready ? 'connected' : processRunning ? 'connecting' : 'disconnected';
+
+    const value = {
+      ...base,
+      configured: base.configured || isValidTunnelId(parsed?.tunnel_id || ''),
+      alias: parsed?.alias || alias,
+      runtimeStatus,
+      ready,
+      healthy,
+      processRunning,
+      target: target || expectedTarget,
+      lastMessage: ready
+        ? 'Tunnel-client đang ready và target đúng MCP local.'
+        : target && !targetMatches
+          ? `Tunnel alias đang target ${target}, không phải ${expectedTarget}.`
+          : base.lastMessage
+    };
+
+    tunnelRuntime.status = runtimeStatus;
+    if (!tunnelRuntime.tunnelId && isValidTunnelId(parsed?.tunnel_id || '')) tunnelRuntime.tunnelId = parsed.tunnel_id;
+    if (parsed?.alias) tunnelRuntime.alias = parsed.alias;
+    tunnelProbeCache = { at: Date.now(), value };
+    return value;
+  } catch (error) {
+    const value = {
+      ...base,
+      ready: false,
+      healthy: false,
+      processRunning: false,
+      lastMessage: `Không đọc được live tunnel status: ${error instanceof Error ? error.message : String(error)}`
+    };
+    tunnelProbeCache = { at: Date.now(), value };
+    return value;
+  }
 }
 
 function connectTunnel({ tunnelId, alias, runtimeApiKey }) {
@@ -379,10 +474,6 @@ const projectIndependentTools = new Set(['health', 'project_list', 'audit_tail']
 
 function toolProjectContext(name, args = {}) {
   if (projectIndependentTools.has(name)) return null;
-  if (['process_logs', 'stop_process'].includes(name) && !args.projectId && args.id) {
-    const processRecord = processRegistry.get(args.id);
-    if (processRecord?.projectId) return projectContext(processRecord.projectId);
-  }
   return projectContext(args.projectId);
 }
 
@@ -433,7 +524,7 @@ function canonicalCandidatePath(candidate) {
   return path.resolve(canonicalParent, path.relative(parent, candidate));
 }
 
-function resolveWorkspacePath(input = '.', context = projectContext()) {
+function resolveWorkspacePath(input = '.', context) {
   const candidate = path.isAbsolute(input) ? path.resolve(input) : path.resolve(context.workspace, input);
   if (!isInsideRoot(context.workspace, candidate)) {
     const err = new Error(`Path is outside project workspace: ${input}`);
@@ -557,14 +648,14 @@ function runSpawn(file, args, cwd, timeoutMs = 120000, env = process.env) {
   });
 }
 
-async function runCommand(command, cwd = '.', timeoutMs = 120000, context = projectContext()) {
+async function runCommand(command, cwd = '.', timeoutMs = 120000, context) {
   validateCommand(command);
   const resolvedCwd = resolveWorkspacePath(cwd, context);
   const spec = shellSpec(command);
   return runSpawn(spec.file, spec.args, resolvedCwd, timeoutMs);
 }
 
-async function git(args, cwd = '.', timeoutMs = 120000, context = projectContext()) {
+async function git(args, cwd = '.', timeoutMs = 120000, context) {
   return runSpawn('git', args, resolveWorkspacePath(cwd, context), timeoutMs);
 }
 
@@ -572,7 +663,7 @@ function quoteArg(s) {
   return `"${String(s).replace(/"/g, '\\"')}"`;
 }
 
-async function runVerification(cwd = '.', timeoutMsPerStep = 180000, context = projectContext()) {
+async function runVerification(cwd = '.', timeoutMsPerStep = 180000, context) {
   const startedAt = new Date().toISOString();
   const root = resolveWorkspacePath(cwd, context);
   const pkgPath = path.join(root, 'package.json');
@@ -628,7 +719,7 @@ function processSnapshot() {
   };
 }
 
-async function gitDashboardSummary(context = projectContext()) {
+async function gitDashboardSummary(context) {
   const status = await git(['status', '--short', '--branch'], '.', 120000, context);
   if (status.exitCode !== 0) return { available: false, error: (status.stderr || status.stdout || 'Not a Git repository').trim() };
   const lines = status.stdout.trim().split(/\r?\n/).filter(Boolean);
@@ -655,15 +746,15 @@ async function gitDashboardSummary(context = projectContext()) {
   };
 }
 
-function securityDashboardSummary(context = projectContext()) {
+function securityDashboardSummary(context = null) {
   const warnings = [];
   const critical = [];
   if (HOST !== '127.0.0.1') critical.push('MCP listener không bind vào loopback.');
   if (ALLOW_DANGEROUS) critical.push('Dangerous command mode đang được bật.');
   if (SHELL_MODE === 'workspace-trusted') warnings.push('Shell đang ở workspace-trusted; repository scripts có quyền của Windows account.');
   if (BROWSER_ALLOW_EXTERNAL) warnings.push('Browser được phép điều hướng ra host bên ngoài.');
-  const permissions = context.project.permissions;
-  if (permissions.execute && (!permissions.write || !permissions.gitWrite || !permissions.delete)) warnings.push('Execute là quyền mạnh: project scripts có thể thay đổi file/Git ngoài các tool-level permission riêng. Dùng VM/container nếu cần isolation nghiêm ngặt.');
+  const permissions = context?.project?.permissions || null;
+  if (permissions?.execute && (!permissions.write || !permissions.gitWrite || !permissions.delete)) warnings.push('Execute là quyền mạnh: project scripts có thể thay đổi file/Git ngoài các tool-level permission riêng. Dùng VM/container nếu cần isolation nghiêm ngặt.');
   return {
     level: critical.length ? 'danger' : warnings.length ? 'warning' : 'ok',
     critical,
@@ -675,12 +766,16 @@ function securityDashboardSummary(context = projectContext()) {
       { label: 'Dangerous commands', value: ALLOW_DANGEROUS ? 'allowed' : 'blocked', ok: !ALLOW_DANGEROUS },
       { label: 'External browser', value: BROWSER_ALLOW_EXTERNAL ? 'allowed' : 'blocked', ok: !BROWSER_ALLOW_EXTERNAL },
       { label: 'Audit logging', value: 'enabled', ok: true },
-      { label: 'Default project permissions', value: Object.entries(permissions).filter(([, enabled]) => enabled).map(([key]) => key).join(', '), ok: true }
+      { label: 'Project routing', value: permissions ? 'explicit projectId' : 'projectId required', ok: true }
     ]
   };
 }
 
-async function browserDashboardSummary(context = projectContext()) {
+async function browserDashboardSummary(context = null) {
+  if (!context) {
+    const states = [...browserStates.values()];
+    return { active: states.length > 0, projectId: null, url: null, title: null, consoleErrors: states.reduce((sum, state) => sum + state.console.filter(x => x.type === 'error').length, 0), networkErrors: states.reduce((sum, state) => sum + state.networkErrors.length, 0) };
+  }
   const browserState = browserStates.get(context.projectId);
   if (!browserState) return { active: false, projectId: context.projectId, url: null, title: null, consoleErrors: 0, networkErrors: 0 };
   return {
@@ -694,28 +789,18 @@ async function browserDashboardSummary(context = projectContext()) {
 }
 
 async function dashboardPayload() {
-  const context = projectContext();
-  const [gitState, activity, browser] = await Promise.all([
-    gitDashboardSummary(context),
+  const [activity, browser, tunnel] = await Promise.all([
     readAuditEvents(60),
-    browserDashboardSummary(context)
+    browserDashboardSummary(),
+    liveTunnelSummary()
   ]);
   const processes = processSnapshot();
-  const security = securityDashboardSummary(context);
+  const security = securityDashboardSummary();
   const success = activity.filter(x => x.status === 'success').length;
   const failures = activity.filter(x => x.status === 'failure').length;
   const durations = activity.map(x => Number(x.duration_ms)).filter(Number.isFinite);
   const lastError = [...activity].reverse().find(x => x.status === 'failure') || null;
-  const packageInfo = (() => {
-    try {
-      const pkg = JSON.parse(fs.readFileSync(path.join(context.workspace, 'package.json'), 'utf8'));
-      return { name: pkg.name || path.basename(context.workspace), version: pkg.version || null };
-    } catch {
-      return { name: path.basename(context.workspace), version: null };
-    }
-  })();
-  const tunnel = tunnelSummary();
-  const workspaceReady = fs.existsSync(context.workspace);
+  const workspaceReady = projectRegistry.projects.length > 0 && projectRegistry.projects.every(project => fs.existsSync(project.workspace));
   const overall = !workspaceReady
     ? 'down'
     : security.level === 'danger'
@@ -726,18 +811,17 @@ async function dashboardPayload() {
   return {
     service: 'vibecode-mcp-secure',
     version: '0.1.0',
-    workspace: context.workspace,
-    defaultProject: context.project,
-    activeProject: context.project,
+    serverRoot: PROJECT_ROOT,
+    workspace: null,
     projects: projectRegistrySummary(),
-    package: packageInfo,
+    package: { name: `${projectRegistry.projects.length} approved project(s)`, version: null },
     runtime: { node: process.version, platform: process.platform, host: HOST, port: PORT },
     shellMode: SHELL_MODE,
     toolsCalled: Object.fromEntries(toolCounters),
     processes,
     tunnel,
-    git: gitState,
-    verification: verificationByProject.get(context.projectId) || null,
+    git: { available: false, error: 'Choose an explicit projectId in MCP before Git or verification actions.' },
+    verification: null,
     browser,
     security,
     activity: {
@@ -754,15 +838,12 @@ async function dashboardPayload() {
 
 function registerTools(server) {
   server.registerTool('health', {
-    description: 'Return Vibecode MCP health, default project, approved projects, policies, and runtime summary.',
+    description: 'Return Vibecode MCP health, approved projects, policies, and runtime summary.',
     inputSchema: z.object({})
   }, wrappedTool('health', async () => {
-    const context = projectContext();
     return {
       ok: true,
       version: '0.1.0',
-      workspace: context.workspace,
-      defaultProject: { id: context.projectId, name: context.project.name, workspace: context.workspace },
       projects: projectRegistrySummary(),
       host: HOST,
       port: PORT,
@@ -774,29 +855,13 @@ function registerTools(server) {
   }));
 
   server.registerTool('project_list', {
-    description: 'List all approved/enabled projects and show which one is the default fallback for tool calls without projectId.',
+    description: 'List all approved/enabled projects. Every project-scoped tool requires an explicit projectId.',
     inputSchema: z.object({})
   }, wrappedTool('project_list', async () => projectRegistrySummary()));
 
-  server.registerTool('project_set_default', {
-    description: 'Set the default fallback project. Other approved projects remain concurrently enabled and can still be addressed with projectId.',
-    inputSchema: z.object({ projectId: z.string().min(1) })
-  }, wrappedTool('project_set_default', async ({ projectId }) => {
-    const project = await setDefaultProject(projectId);
-    return { defaultProject: projectRegistrySummary().projects.find(p => p.id === project.id) };
-  }));
-
-  server.registerTool('project_switch', {
-    description: 'Backward-compatible alias for project_set_default. It changes only the default fallback; it does not disable or switch off other projects.',
-    inputSchema: z.object({ projectId: z.string().min(1) })
-  }, wrappedTool('project_switch', async ({ projectId }) => {
-    const project = await setDefaultProject(projectId);
-    return { defaultProject: projectRegistrySummary().projects.find(p => p.id === project.id) };
-  }));
-
   server.registerTool('project_info', {
-    description: 'Summarize one approved project. Pass projectId to target a project; omit it to use the default project.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional() })
+    description: 'Summarize one approved project. projectId is required.',
+    inputSchema: z.object({ projectId: z.string().min(1) })
   }, wrappedTool('project_info', async (_args, context) => {
     const result = { projectId: context.projectId, projectName: context.project.name, workspace: context.workspace, exists: fs.existsSync(context.workspace), platform: process.platform };
     try { result.topLevel = (await fsp.readdir(context.workspace)).slice(0, 100); } catch {}
@@ -806,13 +871,13 @@ function registerTools(server) {
   }));
 
   server.registerTool('tree', {
-    description: 'Return a compact directory tree for one approved project. Omit projectId to use the default project.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), path: z.string().default('.'), maxDepth: z.number().int().min(1).max(10).default(4), maxEntries: z.number().int().min(10).max(3000).default(500) })
+    description: 'Return a compact directory tree for one approved project. projectId is required.',
+    inputSchema: z.object({ projectId: z.string().min(1), path: z.string().default('.'), maxDepth: z.number().int().min(1).max(10).default(4), maxEntries: z.number().int().min(10).max(3000).default(500) })
   }, wrappedTool('tree', async ({ path: p = '.', maxDepth = 4, maxEntries = 500 }, context) => buildTree(resolveWorkspacePath(p, context), maxDepth, maxEntries)));
 
   server.registerTool('read_file', {
     description: 'Read a UTF-8 text file inside one approved project, subject to size limits.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), path: z.string() })
+    inputSchema: z.object({ projectId: z.string().min(1), path: z.string() })
   }, wrappedTool('read_file', async ({ path: p }, context) => {
     const file = resolveWorkspacePath(p, context);
     await assertFileSize(file);
@@ -821,7 +886,7 @@ function registerTools(server) {
 
   server.registerTool('read_range', {
     description: 'Read a 1-based inclusive line range from a text file in one approved project.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), path: z.string(), startLine: z.number().int().min(1), endLine: z.number().int().min(1) })
+    inputSchema: z.object({ projectId: z.string().min(1), path: z.string(), startLine: z.number().int().min(1), endLine: z.number().int().min(1) })
   }, wrappedTool('read_range', async ({ path: p, startLine, endLine }, context) => {
     if (endLine < startLine || endLine - startLine > 2000) throw new Error('Invalid or too-large line range (max 2001 lines).');
     const file = resolveWorkspacePath(p, context);
@@ -832,7 +897,7 @@ function registerTools(server) {
 
   server.registerTool('write_file', {
     description: 'Write a UTF-8 file inside one approved project. Parent directories are created automatically.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), path: z.string(), content: z.string(), overwrite: z.boolean().default(true) })
+    inputSchema: z.object({ projectId: z.string().min(1), path: z.string(), content: z.string(), overwrite: z.boolean().default(true) })
   }, wrappedTool('write_file', async ({ path: p, content, overwrite = true }, context) => {
     const file = resolveWorkspacePath(p, context);
     if (!overwrite && fs.existsSync(file)) throw new Error(`File already exists: ${p}`);
@@ -846,7 +911,7 @@ function registerTools(server) {
   server.registerTool('apply_patch', {
     description: 'Apply deterministic exact-text edits to one file in one approved project.',
     inputSchema: z.object({
-      projectId: z.string().min(1).optional(),
+      projectId: z.string().min(1),
       path: z.string(),
       edits: z.array(z.object({ find: z.string().min(1), replace: z.string(), expectedOccurrences: z.number().int().min(1).max(100).default(1) })).min(1).max(50)
     })
@@ -866,7 +931,7 @@ function registerTools(server) {
 
   server.registerTool('delete_path', {
     description: 'Delete a file or directory inside one approved project. Requires confirm=true.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), path: z.string(), recursive: z.boolean().default(false), confirm: z.literal(true) })
+    inputSchema: z.object({ projectId: z.string().min(1), path: z.string(), recursive: z.boolean().default(false), confirm: z.literal(true) })
   }, wrappedTool('delete_path', async ({ path: p, recursive = false }, context) => {
     const target = resolveWorkspacePath(p, context);
     if (target === context.workspace) throw new Error('Refusing to delete project workspace root.');
@@ -876,7 +941,7 @@ function registerTools(server) {
 
   server.registerTool('search_text', {
     description: 'Search UTF-8-ish files recursively inside one approved project using a literal string or regular expression.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), query: z.string().min(1), path: z.string().default('.'), regex: z.boolean().default(false), caseSensitive: z.boolean().default(false), maxResults: z.number().int().min(1).max(500).default(100) })
+    inputSchema: z.object({ projectId: z.string().min(1), query: z.string().min(1), path: z.string().default('.'), regex: z.boolean().default(false), caseSensitive: z.boolean().default(false), maxResults: z.number().int().min(1).max(500).default(100) })
   }, wrappedTool('search_text', async ({ query, path: p = '.', regex = false, caseSensitive = false, maxResults = 100 }, context) => {
     const root = resolveWorkspacePath(p, context);
     const files = await walk(root, 3000);
@@ -903,7 +968,7 @@ function registerTools(server) {
 
   server.registerTool('repo_map', {
     description: 'Generate a compact repository map for one approved project.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), maxDepth: z.number().int().min(1).max(8).default(4) })
+    inputSchema: z.object({ projectId: z.string().min(1), maxDepth: z.number().int().min(1).max(8).default(4) })
   }, wrappedTool('repo_map', async ({ maxDepth = 4 }, context) => {
     let pkg = null;
     try { pkg = JSON.parse(await fsp.readFile(path.join(context.workspace, 'package.json'), 'utf8')); } catch {}
@@ -914,13 +979,13 @@ function registerTools(server) {
   }));
 
   server.registerTool('run_command', {
-    description: 'Run a command in one approved project. Omit projectId to use the default project.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), command: z.string().min(1), cwd: z.string().default('.'), timeoutMs: z.number().int().min(1000).max(600000).default(120000) })
+    description: 'Run a command in one approved project. projectId is required.',
+    inputSchema: z.object({ projectId: z.string().min(1), command: z.string().min(1), cwd: z.string().default('.'), timeoutMs: z.number().int().min(1000).max(600000).default(120000) })
   }, wrappedTool('run_command', async ({ command, cwd = '.', timeoutMs = 120000 }, context) => runCommand(command, cwd, timeoutMs, context)));
 
   server.registerTool('start_process', {
     description: 'Start a long-running development process in one approved project without blocking MCP.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), command: z.string().min(1), cwd: z.string().default('.') })
+    inputSchema: z.object({ projectId: z.string().min(1), command: z.string().min(1), cwd: z.string().default('.') })
   }, wrappedTool('start_process', async ({ command, cwd = '.' }, context) => {
     validateCommand(command);
     const resolvedCwd = resolveWorkspacePath(cwd, context);
@@ -938,13 +1003,13 @@ function registerTools(server) {
   }));
 
   server.registerTool('process_list', {
-    description: 'List MCP-managed processes for one approved project. Omit projectId to use the default project.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional() })
+    description: 'List MCP-managed processes for one approved project. projectId is required.',
+    inputSchema: z.object({ projectId: z.string().min(1) })
   }, wrappedTool('process_list', async (_args, context) => [...processRegistry.values()].filter(p => p.projectId === context.projectId).map(p => ({ id: p.id, pid: p.child.pid, projectId: p.projectId, projectName: context.project.name, command: p.command, cwd: p.cwd, status: p.status, exitCode: p.exitCode }))));
 
   server.registerTool('process_logs', {
     description: 'Read recent logs from a process. projectId is optional and validated when supplied.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), id: z.string(), tail: z.number().int().min(1).max(500).default(100) })
+    inputSchema: z.object({ projectId: z.string().min(1), id: z.string(), tail: z.number().int().min(1).max(500).default(100) })
   }, wrappedTool('process_logs', async ({ id, tail = 100 }, context) => {
     const p = processRegistry.get(id); if (!p) throw new Error(`Unknown process id: ${id}`);
     if (p.projectId !== context.projectId) throw Object.assign(new Error('Process belongs to another project.'), { code: 'PROJECT_MISMATCH' });
@@ -953,7 +1018,7 @@ function registerTools(server) {
 
   server.registerTool('stop_process', {
     description: 'Stop a process previously started by start_process. projectId is optional and validated when supplied.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), id: z.string(), force: z.boolean().default(false) })
+    inputSchema: z.object({ projectId: z.string().min(1), id: z.string(), force: z.boolean().default(false) })
   }, wrappedTool('stop_process', async ({ id, force = false }, context) => {
     const p = processRegistry.get(id); if (!p) throw new Error(`Unknown process id: ${id}`);
     if (p.projectId !== context.projectId) throw Object.assign(new Error('Process belongs to another project.'), { code: 'PROJECT_MISMATCH' });
@@ -963,16 +1028,16 @@ function registerTools(server) {
     return { id, projectId: p.projectId, stopped: true };
   }));
 
-  server.registerTool('git_status', { description: 'Show Git status for one approved project.', inputSchema: z.object({ projectId: z.string().min(1).optional(), cwd: z.string().default('.') }) }, wrappedTool('git_status', async ({ cwd = '.' }, context) => git(['status', '--short', '--branch'], cwd, 120000, context)));
-  server.registerTool('git_diff', { description: 'Show Git diff for one approved project.', inputSchema: z.object({ projectId: z.string().min(1).optional(), cwd: z.string().default('.'), staged: z.boolean().default(false) }) }, wrappedTool('git_diff', async ({ cwd = '.', staged = false }, context) => git(staged ? ['diff', '--cached'] : ['diff'], cwd, 120000, context)));
-  server.registerTool('git_log', { description: 'Show recent Git commits for one approved project.', inputSchema: z.object({ projectId: z.string().min(1).optional(), cwd: z.string().default('.'), limit: z.number().int().min(1).max(100).default(20) }) }, wrappedTool('git_log', async ({ cwd = '.', limit = 20 }, context) => git(['log', `-${limit}`, '--oneline', '--decorate'], cwd, 120000, context)));
-  server.registerTool('git_add', { description: 'Stage paths in Git for one approved project.', inputSchema: z.object({ projectId: z.string().min(1).optional(), paths: z.array(z.string()).min(1).max(100), cwd: z.string().default('.') }) }, wrappedTool('git_add', async ({ paths, cwd = '.' }, context) => git(['add', '--', ...paths], cwd, 120000, context)));
-  server.registerTool('git_commit', { description: 'Create a Git commit in one approved project from staged changes.', inputSchema: z.object({ projectId: z.string().min(1).optional(), message: z.string().min(1).max(500), cwd: z.string().default('.') }) }, wrappedTool('git_commit', async ({ message, cwd = '.' }, context) => git(['commit', '-m', message], cwd, 120000, context)));
-  server.registerTool('git_restore', { description: 'Restore working-tree paths in one approved project. Destructive; requires confirm=true.', inputSchema: z.object({ projectId: z.string().min(1).optional(), paths: z.array(z.string()).min(1), staged: z.boolean().default(false), cwd: z.string().default('.'), confirm: z.literal(true) }) }, wrappedTool('git_restore', async ({ paths, staged = false, cwd = '.' }, context) => git(staged ? ['restore', '--staged', '--', ...paths] : ['restore', '--', ...paths], cwd, 120000, context)));
+  server.registerTool('git_status', { description: 'Show Git status for one approved project.', inputSchema: z.object({ projectId: z.string().min(1), cwd: z.string().default('.') }) }, wrappedTool('git_status', async ({ cwd = '.' }, context) => git(['status', '--short', '--branch'], cwd, 120000, context)));
+  server.registerTool('git_diff', { description: 'Show Git diff for one approved project.', inputSchema: z.object({ projectId: z.string().min(1), cwd: z.string().default('.'), staged: z.boolean().default(false) }) }, wrappedTool('git_diff', async ({ cwd = '.', staged = false }, context) => git(staged ? ['diff', '--cached'] : ['diff'], cwd, 120000, context)));
+  server.registerTool('git_log', { description: 'Show recent Git commits for one approved project.', inputSchema: z.object({ projectId: z.string().min(1), cwd: z.string().default('.'), limit: z.number().int().min(1).max(100).default(20) }) }, wrappedTool('git_log', async ({ cwd = '.', limit = 20 }, context) => git(['log', `-${limit}`, '--oneline', '--decorate'], cwd, 120000, context)));
+  server.registerTool('git_add', { description: 'Stage paths in Git for one approved project.', inputSchema: z.object({ projectId: z.string().min(1), paths: z.array(z.string()).min(1).max(100), cwd: z.string().default('.') }) }, wrappedTool('git_add', async ({ paths, cwd = '.' }, context) => git(['add', '--', ...paths], cwd, 120000, context)));
+  server.registerTool('git_commit', { description: 'Create a Git commit in one approved project from staged changes.', inputSchema: z.object({ projectId: z.string().min(1), message: z.string().min(1).max(500), cwd: z.string().default('.') }) }, wrappedTool('git_commit', async ({ message, cwd = '.' }, context) => git(['commit', '-m', message], cwd, 120000, context)));
+  server.registerTool('git_restore', { description: 'Restore working-tree paths in Git for one approved project. Destructive; requires confirm=true.', inputSchema: z.object({ projectId: z.string().min(1), paths: z.array(z.string()).min(1), staged: z.boolean().default(false), cwd: z.string().default('.'), confirm: z.literal(true) }) }, wrappedTool('git_restore', async ({ paths, staged = false, cwd = '.' }, context) => git(staged ? ['restore', '--staged', '--', ...paths] : ['restore', '--', ...paths], cwd, 120000, context)));
 
   server.registerTool('verify_project', {
     description: 'Run available lint/typecheck/test/build scripts for one approved project and summarize results.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), cwd: z.string().default('.'), timeoutMsPerStep: z.number().int().min(5000).max(600000).default(180000) })
+    inputSchema: z.object({ projectId: z.string().min(1), cwd: z.string().default('.'), timeoutMsPerStep: z.number().int().min(5000).max(600000).default(180000) })
   }, wrappedTool('verify_project', async ({ cwd = '.', timeoutMsPerStep = 180000 }, context) => runVerification(cwd, timeoutMsPerStep, context)));
 
   server.registerTool('audit_tail', {
@@ -985,7 +1050,7 @@ function registerTools(server) {
 
   server.registerTool('browser_open', {
     description: 'Open a URL in the browser session owned by one approved project.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), url: z.string().url() })
+    inputSchema: z.object({ projectId: z.string().min(1), url: z.string().url() })
   }, wrappedTool('browser_open', async ({ url }, context) => {
     const state = await ensureBrowser(context);
     validateBrowserUrl(url);
@@ -995,22 +1060,22 @@ function registerTools(server) {
 
   server.registerTool('browser_click', {
     description: 'Click an element in one project browser session using a Playwright selector.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), selector: z.string().min(1) })
+    inputSchema: z.object({ projectId: z.string().min(1), selector: z.string().min(1) })
   }, wrappedTool('browser_click', async ({ selector }, context) => { const s = await ensureBrowser(context); await s.page.locator(selector).first().click({ timeout: 15000 }); return { projectId: context.projectId, url: s.page.url(), title: await s.page.title() }; }));
 
   server.registerTool('browser_fill', {
     description: 'Fill an input in one project browser session using a Playwright selector.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), selector: z.string().min(1), value: z.string() })
+    inputSchema: z.object({ projectId: z.string().min(1), selector: z.string().min(1), value: z.string() })
   }, wrappedTool('browser_fill', async ({ selector, value }, context) => { const s = await ensureBrowser(context); await s.page.locator(selector).first().fill(value, { timeout: 15000 }); return { projectId: context.projectId, ok: true }; }));
 
   server.registerTool('browser_snapshot', {
     description: 'Return one project browser page URL/title/body text plus recent console/network errors.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), maxChars: z.number().int().min(1000).max(50000).default(12000) })
+    inputSchema: z.object({ projectId: z.string().min(1), maxChars: z.number().int().min(1000).max(50000).default(12000) })
   }, wrappedTool('browser_snapshot', async ({ maxChars = 12000 }, context) => { const s = await ensureBrowser(context); const body = (await s.page.locator('body').innerText().catch(() => '')).slice(0, maxChars); return { projectId: context.projectId, url: s.page.url(), title: await s.page.title(), bodyText: body, console: s.console.slice(-50), networkErrors: s.networkErrors.slice(-50) }; }));
 
   server.registerTool('browser_screenshot', {
     description: 'Save a screenshot under the selected project .vibecode-artifacts directory.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional(), name: z.string().regex(/^[A-Za-z0-9._-]+$/).default('screenshot.png'), fullPage: z.boolean().default(true) })
+    inputSchema: z.object({ projectId: z.string().min(1), name: z.string().regex(/^[A-Za-z0-9._-]+$/).default('screenshot.png'), fullPage: z.boolean().default(true) })
   }, wrappedTool('browser_screenshot', async ({ name = 'screenshot.png', fullPage = true }, context) => {
     const s = await ensureBrowser(context);
     await fsp.mkdir(context.artifactDir, { recursive: true });
@@ -1022,7 +1087,7 @@ function registerTools(server) {
 
   server.registerTool('browser_close', {
     description: 'Close the browser session for one approved project.',
-    inputSchema: z.object({ projectId: z.string().min(1).optional() })
+    inputSchema: z.object({ projectId: z.string().min(1) })
   }, wrappedTool('browser_close', async (_args, context) => {
     const browserState = browserStates.get(context.projectId);
     if (browserState) {
@@ -1041,7 +1106,7 @@ function validateBrowserUrl(value) {
   if (!local.has(u.hostname)) throw Object.assign(new Error(`External browser host blocked: ${u.hostname}`), { code: 'POLICY_DENIED' });
 }
 
-async function ensureBrowser(context = projectContext()) {
+async function ensureBrowser(context) {
   const existing = browserStates.get(context.projectId);
   if (existing) return existing;
   const { chromium } = await import('playwright');
@@ -1069,13 +1134,11 @@ const nodeMcpHandler = toNodeHandler(mcpHandler);
 app.all('/mcp', (req, res) => nodeMcpHandler(req, res, req.body));
 
 app.get('/healthz', (_req, res) => {
-  const context = projectContext();
-  res.json({ ok: true, service: 'vibecode-mcp-secure', workspace: context.workspace, defaultProjectId: context.projectId, projectCount: projectRegistry.projects.length });
+  res.json({ ok: true, service: 'vibecode-mcp-secure', serverRoot: PROJECT_ROOT, projectCount: projectRegistry.projects.length, projectIdRequired: true });
 });
 app.get('/readyz', async (_req, res) => {
-  const context = projectContext();
-  const workspaceExists = fs.existsSync(context.workspace);
-  res.status(workspaceExists ? 200 : 503).json({ ready: workspaceExists, workspace: context.workspace, defaultProjectId: context.projectId, projectCount: projectRegistry.projects.length, reason: workspaceExists ? undefined : 'workspace_not_found' });
+  const projectsReady = projectRegistry.projects.length > 0 && projectRegistry.projects.every(project => fs.existsSync(project.workspace));
+  res.status(projectsReady ? 200 : 503).json({ ready: projectsReady, service: 'vibecode-mcp-secure', serverRoot: PROJECT_ROOT, projectCount: projectRegistry.projects.length, projectIdRequired: true, reason: projectsReady ? undefined : 'project_workspace_not_found' });
 });
 function requireLoopbackRequest(req) {
   const address = String(req.socket?.remoteAddress || '');
@@ -1084,7 +1147,70 @@ function requireLoopbackRequest(req) {
   }
 }
 
+function folderPickerRoots() {
+  if (process.platform !== 'win32') return [path.parse(INITIAL_WORKSPACE).root];
+  const roots = [];
+  for (let code = 65; code <= 90; code++) {
+    const root = String.fromCharCode(code) + ':\\';
+    try { if (fs.existsSync(root) && fs.statSync(root).isDirectory()) roots.push(root); } catch {}
+  }
+  return roots;
+}
+
+function localFolderInfo(inputPath) {
+  const raw = String(inputPath || '').trim();
+  if (!raw) throw new Error('Folder path is required.');
+  if (!path.isAbsolute(raw)) throw new Error('Folder path must be absolute.');
+  const resolved = path.resolve(raw);
+  let stat;
+  try { stat = fs.statSync(resolved); } catch { throw new Error('Folder does not exist or cannot be opened.'); }
+  if (!stat.isDirectory()) throw new Error('Path is not a folder.');
+  return { resolved, canonical: fs.realpathSync(resolved) };
+}
+
+async function listLocalFolders(inputPath) {
+  const folder = localFolderInfo(inputPath || path.parse(INITIAL_WORKSPACE).root);
+  const entries = await fsp.readdir(folder.canonical, { withFileTypes: true });
+  const folders = entries
+    .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith('.'))
+    .map(entry => ({ name: entry.name, path: path.join(folder.resolved, entry.name) }))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+    .slice(0, 300);
+  const parent = path.dirname(folder.resolved);
+  return { currentPath: folder.resolved, parentPath: parent === folder.resolved ? null : parent, roots: folderPickerRoots(), folders, truncated: entries.length > folders.length };
+}
+
+async function createLocalFolder({ parentPath, name }) {
+  const folderName = String(name || '').trim();
+  if (!folderName || folderName === '.' || folderName === '..' || folderName !== path.basename(folderName) || /[\\/:*?"<>|\x00-\x1f]/.test(folderName)) {
+    throw new Error('Folder name must be a single valid folder name.');
+  }
+  const parent = localFolderInfo(parentPath);
+  const target = path.join(parent.canonical, folderName);
+  if (path.dirname(target) !== parent.canonical) throw new Error('Folder must be created directly inside the selected folder.');
+  try { await fsp.mkdir(target); }
+  catch (error) {
+    if (error?.code === 'EEXIST') throw new Error('A folder with that name already exists.');
+    throw error;
+  }
+  return localFolderInfo(target).resolved;
+}
+
 app.get('/api/projects', (_req, res) => res.json(projectRegistrySummary()));
+app.get('/api/folders', async (req, res) => {
+  try {
+    requireLoopbackRequest(req);
+    res.json({ ok: true, ...await listLocalFolders(req.query?.path ? String(req.query.path) : undefined) });
+  } catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
+});
+app.post('/api/folders', async (req, res) => {
+  try {
+    requireLoopbackRequest(req);
+    const createdPath = await createLocalFolder({ parentPath: req.body?.parentPath, name: req.body?.name });
+    await audit('local_folder_create', { parentPath: req.body?.parentPath, name: req.body?.name }, 'success');
+    res.status(201).json({ ok: true, createdPath, ...await listLocalFolders(createdPath) });
+  } catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
+});
 app.post('/api/projects', async (req, res) => {
   try {
     requireLoopbackRequest(req);
@@ -1092,20 +1218,9 @@ app.post('/api/projects', async (req, res) => {
     res.status(201).json({ ok: true, project, projects: projectRegistrySummary() });
   } catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
 });
-app.post('/api/projects/:id/default', async (req, res) => {
-  try {
-    requireLoopbackRequest(req);
-    const project = await setDefaultProject(req.params.id);
-    res.json({ ok: true, project, projects: projectRegistrySummary() });
-  } catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
-});
-app.post('/api/projects/:id/activate', async (req, res) => {
-  try {
-    requireLoopbackRequest(req);
-    const project = await setDefaultProject(req.params.id);
-    res.json({ ok: true, project, projects: projectRegistrySummary(), deprecated: 'Use /default. Other projects remain enabled.' });
-  } catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
-});
+app.post('/api/projects/:id/fallback', (_req, res) => res.status(410).json({ ok: false, error: 'Fallback routing was removed. Every MCP project-scoped tool requires projectId.' }));
+app.post('/api/projects/:id/default', (_req, res) => res.status(410).json({ ok: false, error: 'Fallback routing was removed. Every MCP project-scoped tool requires projectId.' }));
+app.post('/api/projects/:id/activate', (_req, res) => res.status(410).json({ ok: false, error: 'Active project switching was removed. Every MCP project-scoped tool requires projectId.' }));
 app.patch('/api/projects/:id/permissions', async (req, res) => {
   try {
     requireLoopbackRequest(req);
@@ -1173,8 +1288,15 @@ app.post('/api/tunnel/connect', (req, res) => {
   }
 });
 app.post('/api/tunnel/disconnect', (_req, res) => {
-  try { res.json({ ok: true, tunnel: disconnectTunnel() }); }
+  try {
+    tunnelProbeCache = { at: 0, value: null };
+    res.json({ ok: true, tunnel: disconnectTunnel() });
+  }
   catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
+});
+app.get('/api/tunnel/status', async (_req, res) => {
+  try { res.json({ ok: true, tunnel: await liveTunnelSummary({ maxAgeMs: 0 }) }); }
+  catch (error) { res.status(500).json({ ok: false, error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get('/', async (_req, res) => {
   try { res.type('html').send(await fsp.readFile(path.join(PROJECT_ROOT, 'src', 'control-center.html'), 'utf8')); }
@@ -1182,10 +1304,8 @@ app.get('/', async (_req, res) => {
 });
 
 const httpServer = app.listen(PORT, HOST, () => {
-  const context = projectContext();
   console.log(`[vibecode-mcp] listening on http://${HOST}:${PORT}`);
   console.log(`[vibecode-mcp] MCP endpoint http://${HOST}:${PORT}/mcp`);
-  console.log(`[vibecode-mcp] default project ${context.project.name} -> ${context.workspace}`);
   console.log(`[vibecode-mcp] approved projects ${projectRegistry.projects.length}`);
   console.log(`[vibecode-mcp] shell mode ${SHELL_MODE}`);
 });

@@ -18,7 +18,7 @@ This project intentionally keeps the architecture simple:
 - `runtimes connect` + `runtimes status`
 - `/healthz`, `/readyz`, local Operations Control Center
 - runtime Overview for projects/workspace, Git, processes, verification, activity, security and Tunnel state
-- Multi-Project Router registry: approve multiple local workspaces, keep them concurrently enabled, choose a `defaultProjectId`, and persist per-project tool permissions
+- Multi-Project Router registry: approve multiple local workspaces, keep them concurrently enabled, choose a `fallbackProjectId`, and persist per-project tool permissions
 
 ### Layer 2 — Execution Runtime
 
@@ -28,7 +28,7 @@ This project intentionally keeps the architecture simple:
 - `start_process`, `process_list`, `process_logs`, `stop_process`
 - Git tools
 - Playwright browser tools
-- all project-scoped tools accept optional `projectId`; omitted `projectId` routes to the default project
+- all project-scoped tools accept optional `projectId`; omitted `projectId` routes to the fallback project
 
 ### Layer 3 — Code Intelligence / Context
 
@@ -53,7 +53,7 @@ LSP/AST semantic navigation is left as the next extension point rather than ship
 - external browser URLs blocked by default
 - NDJSON audit log with recursive secret/source-content redaction
 - Operations Control Center and enriched status endpoint
-- project registry with loopback-only Add/Remove/permission changes; MCP can route only to already-approved projects and can change only the default fallback, never widen filesystem scope
+- project registry with loopback-only Add/Remove/permission changes; MCP can route only to already-approved projects and can change only the fallback, never widen filesystem scope
 
 ### Layer 6 — Harness / Skills
 
@@ -71,10 +71,10 @@ LSP/AST semantic navigation is left as the next extension point rather than ship
 For an already prepared installation, double-click:
 
 ```text
-VibecodeMCP.exe
+START.cmd
 ```
 
-The native Windows app starts/checks the local MCP and Secure Tunnel in the background and shows the Control Center directly in a Windows desktop UI. The browser is not opened automatically.
+The CLI launcher starts/checks the local MCP and Secure Tunnel. It does not open a desktop application; use the local Control Center URL when needed.
 
 For a brand-new machine/install, run once:
 
@@ -82,7 +82,7 @@ For a brand-new machine/install, run once:
 FIRST-RUN.cmd
 ```
 
-It runs Setup, then uses `VibecodeMCP.exe --configure` for one-time workspace/tunnel configuration.
+It runs Setup, then uses `VibecodeMCP.Cli.exe --configure` for one-time workspace/tunnel configuration.
 
 ## 0. Prerequisites
 
@@ -169,12 +169,12 @@ The runtime API key is deliberately not stored in `.env`. The Windows launcher c
 Preferred Windows launcher:
 
 ```text
-VibecodeMCP.exe
+VibecodeMCP.Cli.exe --no-open
 ```
 
-`START.cmd` now delegates to the EXE when it is present and falls back to the PowerShell launcher otherwise.
+`START.cmd` delegates to the CLI launcher when it is present and falls back to the PowerShell launcher otherwise.
 
-The EXE:
+The CLI launcher:
 
 1. discovers/normalizes the local stable configuration (default port `1167`);
 2. starts the MCP only when it is not already healthy;
@@ -183,19 +183,17 @@ The EXE:
 5. if credentials are needed, requests the Runtime API key once and stores it encrypted with Windows DPAPI under `.runtime`;
 6. runs official `tunnel-client runtimes connect` when required;
 7. verifies `runtimes status`;
-8. keeps the localhost backend hidden and shows status/projects/logs/settings in the native Windows app. The browser opens only when you explicitly click **Open Web Console**.
-
-The app uses `VibecodeMCP.Cli.exe` as a background helper for start/stop/tunnel operations. You normally launch only `VibecodeMCP.exe`.
+8. prints the local endpoint and exits after the MCP and tunnel are ready.
 
 Useful modes:
 
 ```text
-VibecodeMCP.exe --status
-VibecodeMCP.exe --stop
-VibecodeMCP.exe --configure
-VibecodeMCP.exe --reset-key
-VibecodeMCP.exe --self-test
-VibecodeMCP.exe --no-open
+VibecodeMCP.Cli.exe --status
+VibecodeMCP.Cli.exe --stop
+VibecodeMCP.Cli.exe --configure
+VibecodeMCP.Cli.exe --reset-key
+VibecodeMCP.Cli.exe --self-test
+VibecodeMCP.Cli.exe --no-open
 ```
 
 Local Control Center:
@@ -360,3 +358,5 @@ OpenAI official/public references used for this starter:
 - `https://platform.openai.com/settings/organization/tunnels`
 
 The setup script intentionally downloads the **latest release at setup time** instead of pinning a stale tunnel binary inside this ZIP.
+
+- MCP tools cannot change FALLBACK or activate/switch projects. Routing mutations are local-only; agents route directly with projectId.

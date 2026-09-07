@@ -8,10 +8,10 @@ echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\Setup.ps1"
 if errorlevel 1 goto :fail
 
-if exist ".\VibecodeMCP.exe" (
-  ".\VibecodeMCP.exe" --configure
+if exist ".\VibecodeMCP.Cli.exe" (
+  ".\VibecodeMCP.Cli.exe" --configure
   if errorlevel 1 goto :fail
-  ".\VibecodeMCP.exe"
+  ".\VibecodeMCP.Cli.exe" --no-open
   if errorlevel 1 goto :fail
 ) else (
   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\Configure.ps1"
