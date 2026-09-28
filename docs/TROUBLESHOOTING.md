@@ -52,6 +52,8 @@ SETUP.cmd
 
 The setup script fetches the latest official Windows x64 release from `openai/tunnel-client`.
 
+On macOS, run `SETUP-MACOS.command` instead. It downloads the matching official macOS `arm64` or `amd64` archive into `bin/tunnel-client`.
+
 ## Command denied
 
 The default shell mode is `allowlist`.

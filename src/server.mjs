@@ -27,7 +27,7 @@ const RUNTIME_DIR = path.resolve(process.env.VIBECODE_RUNTIME_DIR || path.join(P
 const AUDIT_FILE = path.join(RUNTIME_DIR, 'audit.ndjson');
 const TUNNEL_ID = process.env.CONTROL_PLANE_TUNNEL_ID || '';
 const TUNNEL_ALIAS = process.env.TUNNEL_ALIAS || 'vibecode-local';
-const TUNNEL_CLIENT = path.join(PROJECT_ROOT, 'bin', 'tunnel-client.exe');
+const TUNNEL_CLIENT = path.join(PROJECT_ROOT, 'bin', process.platform === 'win32' ? 'tunnel-client.exe' : 'tunnel-client');
 const PROJECTS_FILE = path.join(RUNTIME_DIR, 'projects.json');
 const DEFAULT_PROJECT_PERMISSIONS = Object.freeze({ read: true, write: true, execute: true, process: true, gitWrite: true, browser: true, delete: true });
 const SAFE_NEW_PROJECT_PERMISSIONS = Object.freeze({ read: true, write: true, execute: true, process: true, gitWrite: false, browser: true, delete: false });
@@ -387,7 +387,7 @@ function connectTunnel({ tunnelId, alias, runtimeApiKey }) {
   if (!isValidTunnelId(tunnelId)) throw new Error('Tunnel ID phải có dạng tunnel_...');
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(alias)) throw new Error('Alias chỉ dùng chữ, số, dấu chấm, gạch dưới hoặc gạch nối.');
   if (!runtimeApiKey || !runtimeApiKey.trim()) throw new Error('Cần Runtime API key để kết nối Tunnel.');
-  if (!fs.existsSync(TUNNEL_CLIENT)) throw new Error('Chưa có tunnel-client. Hãy chạy SETUP.cmd trước.');
+  if (!fs.existsSync(TUNNEL_CLIENT)) throw new Error('Chưa có tunnel-client. Hãy chạy script setup phù hợp với hệ điều hành trước.');
   if (tunnelRuntime.child && !tunnelRuntime.child.killed) throw new Error('Một Tunnel đang được kết nối. Hãy ngắt kết nối trước khi tạo kết nối mới.');
 
   let secret = runtimeApiKey.trim();
@@ -440,7 +440,7 @@ function connectTunnel({ tunnelId, alias, runtimeApiKey }) {
 }
 
 function disconnectTunnel() {
-  if (!fs.existsSync(TUNNEL_CLIENT)) throw new Error('Chưa có tunnel-client. Hãy chạy SETUP.cmd trước.');
+  if (!fs.existsSync(TUNNEL_CLIENT)) throw new Error('Chưa có tunnel-client. Hãy chạy script setup phù hợp với hệ điều hành trước.');
   tunnelRuntime.status = 'disconnecting';
   tunnelRuntime.lastMessage = 'Đang ngắt Tunnel…';
   if (tunnelRuntime.child && !tunnelRuntime.child.killed) tunnelRuntime.child.kill();

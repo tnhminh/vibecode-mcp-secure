@@ -91,6 +91,12 @@ Nếu có lỗi, chạy:
 DOCTOR.cmd
 ```
 
+### macOS
+
+Các file `.cmd` và `VibecodeMCP.Cli.exe` chỉ chạy trên Windows. Trên macOS, chạy lần đầu bằng `SETUP-MACOS.command` (có thể right-click → **Open** nếu Gatekeeper hỏi). Sau đó sửa `.env` với đường dẫn kiểu `/Users/ban/Projects/project` và tunnel ID. Mỗi lần khởi động dùng `START-MACOS.command`; script sẽ hỏi Runtime API key nhưng không lưu key vào `.env`. Dừng bằng `STOP-MACOS.command`.
+
+Script setup macOS tự chọn `tunnel-client` cho Apple Silicon hoặc Intel, cài dependency và Chromium. Cần Node.js 20+.
+
 ## 4) Kết nối ChatGPT
 
 Trong ChatGPT:

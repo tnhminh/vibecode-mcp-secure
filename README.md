@@ -339,6 +339,17 @@ Do not claim DONE unless relevant verification passes.
 
 ---
 
+# macOS quick start
+
+The Windows CLI executable and `.cmd` files do not run on macOS. Use the included Bash launchers instead; the MCP server itself is the same.
+
+1. Copy this repository to the Mac and install Node.js 20+.
+2. Double-click `SETUP-MACOS.command` in Finder. If Gatekeeper blocks it, right-click → **Open** once, or run `bash SETUP-MACOS.command` in Terminal.
+3. Edit `.env`: set `VIBECODE_WORKSPACE` to an existing macOS folder such as `/Users/name/Projects/my-project`, and set `CONTROL_PLANE_TUNNEL_ID`.
+4. Double-click `START-MACOS.command`. It asks for the Runtime API key each time and never saves it to `.env`.
+
+The setup launcher installs npm dependencies, Playwright Chromium, and the official `tunnel-client` matching Apple Silicon (`arm64`) or Intel (`amd64`). To stop the launcher-managed services, double-click `STOP-MACOS.command`.
+
 # Security model
 
 The server listens on `127.0.0.1` only. Secure MCP Tunnel is expected to be the only remote path to it.

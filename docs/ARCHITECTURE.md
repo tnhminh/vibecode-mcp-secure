@@ -13,7 +13,7 @@
                        │ outbound HTTPS :443
                        │
 ┌──────────────────────┴──────────────────────┐
-│ official tunnel-client.exe                  │
+│ official tunnel-client (OS-specific binary) │
 │ long poll / forward / return MCP result     │
 └──────────────────────┬──────────────────────┘
                        │ loopback HTTP
